@@ -1,0 +1,31 @@
+name: Build Tickmarks plug-in
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build 64-bit
+        run: msbuild build\Tickmarks.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SolutionDir=%CD%\build\ /m /v:minimal
+        shell: cmd
+      - name: Build 32-bit
+        run: msbuild build\Tickmarks.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:SolutionDir=%CD%\build\ /m /v:minimal
+        shell: cmd
+      - name: Package
+        shell: pwsh
+        run: |
+          $pkg = New-Item -ItemType Directory -Force -Path package\Tickmarks
+          New-Item -ItemType Directory -Force -Path "$pkg\x64", "$pkg\x86" | Out-Null
+          Copy-Item out\x64\Tickmarks.api "$pkg\x64\"
+          Copy-Item out\Win32\Tickmarks.api "$pkg\x86\"
+          Copy-Item installer\* $pkg
+          Compress-Archive -Path $pkg -DestinationPath package\Tickmarks-plugin.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tickmarks-plugin
+          path: package/Tickmarks
