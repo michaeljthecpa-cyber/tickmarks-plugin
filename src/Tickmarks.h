@@ -35,7 +35,8 @@ int         ColorCount();
 const char *ColorName(int i);
 const char *SizeName(int i);
 
-// Places a mark centred on the device point. Returns true if a mark was added.
-bool PlaceMark(AVPageView pageView, AVDevCoord x, AVDevCoord y, MarkMode mode);
+// Places a mark centred on the device point, or sized to fit 'dragged' (page space) when the
+// user dragged out a box. Returns true if a mark was added.
+bool PlaceMark(AVPageView pageView, AVDevCoord x, AVDevCoord y, MarkMode mode, const ASFixedRect *dragged);
 // Adds a sticky note with its pop-up open at the device point.
 bool PlaceNote(AVPageView pageView, AVDevCoord x, AVDevCoord y);

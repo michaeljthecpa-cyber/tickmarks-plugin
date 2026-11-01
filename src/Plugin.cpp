@@ -10,7 +10,7 @@
 
 extern "C" HINSTANCE gHINSTANCE;
 
-TickmarkSettings gSettings = { 1, 0, true, true, 0, 1, 0 };
+TickmarkSettings gSettings = { 1, 0, true, true, 0, 0, 0 };
 
 /*-------------------------------------------------------
 	Settings (HKCU\Software\Tickmarks), kept across restarts
@@ -43,7 +43,7 @@ void LoadSettings()
     gSettings.autoIncrement = ReadInt(key, "AutoIncrement", 1, 0, 1) != 0;
     gSettings.wrap          = ReadInt(key, "Wrap", 1, 0, 1) != 0;
     gSettings.color         = ReadInt(key, "Color", 0, 0, ColorCount() - 1);
-    gSettings.size          = ReadInt(key, "Size", 1, 0, 2);
+    gSettings.size          = ReadInt(key, "MarkSize", 0, 0, 2);
     gSettings.symbol        = ReadInt(key, "Symbol", 0, 0, SymbolCount() - 1);
     RegCloseKey(key);
 }
@@ -59,7 +59,7 @@ void SaveSettings()
         WriteInt(key, "AutoIncrement", gSettings.autoIncrement ? 1 : 0);
         WriteInt(key, "Wrap", gSettings.wrap ? 1 : 0);
         WriteInt(key, "Color", gSettings.color);
-        WriteInt(key, "Size", gSettings.size);
+        WriteInt(key, "MarkSize", gSettings.size);
         WriteInt(key, "Symbol", gSettings.symbol);
         RegCloseKey(key);
     }
@@ -83,7 +83,7 @@ static ACCB1 ASBool ACCB2 ToolIsPersistent(AVTool tool) { return true; }
 
 static ACCB1 ASBool ACCB2 ToolAdjustCursor(AVTool tool, AVPageView pageView, AVDevCoord x, AVDevCoord y)
 {
-    AVSysSetCursor(AVSysGetStandardCursor(CROSSHAIR_CURSOR));
+    AVSysSetCursor(AVSysGetStandardCursor(ARROW_CURSOR));
     return true;
 }
 
@@ -94,10 +94,16 @@ static ACCB1 ASBool ACCB2 ToolDoClick(AVTool tool, AVPageView pageView, AVDevCoo
     PDAnnot hit;
     if (!(AVSysGetModifiers() & AV_SHIFT) && AVPageViewIsAnnotAtPoint(pageView, x, y, &hit))
         return false;
-    if (gMode == kModeNote)
+    if (gMode == kModeNote) {
         PlaceNote(pageView, x, y);
-    else
-        PlaceMark(pageView, x, y, gMode);
+        return true;
+    }
+    // Click to place at the chosen size, or click-and-drag to size the mark as you place it.
+    AVDevRect drag;
+    AVPageViewDragOutNewRect(pageView, x, y, &drag);
+    ASFixedRect pageRect;
+    AVPageViewDeviceRectToPage(pageView, &drag, &pageRect);
+    PlaceMark(pageView, x, y, gMode, &pageRect);
     return true;
 }
 

@@ -22,7 +22,7 @@ static const Rgb kColors[] = {
     { "Orange", 0.95, 0.47, 0.00 },
 };
 static const char  *kSizeNames[]  = { "Small", "Medium", "Large" };
-static const double kSizeScales[] = { 0.75, 1.0, 1.4 };
+static const double kSizeScales[] = { 0.5625, 1.0, 1.4 };
 
 static const double kLineWidth = 2.2;
 static const double kTextSize  = 13.0;
@@ -244,7 +244,7 @@ static void Redraw(AVPageView pageView)
 	Placing marks
 -------------------------------------------------------*/
 
-bool PlaceMark(AVPageView pageView, AVDevCoord x, AVDevCoord y, MarkMode mode)
+bool PlaceMark(AVPageView pageView, AVDevCoord x, AVDevCoord y, MarkMode mode, const ASFixedRect *dragged)
 {
     bool placed = false;
     DURING
@@ -253,12 +253,11 @@ bool PlaceMark(AVPageView pageView, AVDevCoord x, AVDevCoord y, MarkMode mode)
         CosDoc cd = PDDocGetCosDoc(pdDoc);
 
         // What to draw, in the Medium-size base box.
-        std::string id, label, body;
+        std::string id, body;
         double w = 20, h = 20;
         if (mode == kModeSymbol) {
             const Symbol &s = kSymbols[(gSettings.symbol >= 0 && gSettings.symbol < SymbolCount()) ? gSettings.symbol : 0];
             id = s.id;
-            label = s.label;
             if (s.draw) {
                 w = s.w; h = s.h;
                 body = s.draw(w, h);
@@ -273,30 +272,48 @@ bool PlaceMark(AVPageView pageView, AVDevCoord x, AVDevCoord y, MarkMode mode)
             if (mode == kModeNumber) {
                 txt = std::to_string(gSettings.nextNumber);
                 id = "number";
-                label = "Number " + txt;
             } else {
                 txt = std::string(1, (char)('A' + gSettings.nextLetter));
                 id = "letter";
-                label = "Letter " + txt;
             }
-            double size = 14, tw = TextWidth(txt, size);
-            w = tw + 7 > 22 ? tw + 7 : 22;
-            body = "BT /HeBo " + N(size) + " Tf " + N((w - tw) / 2) + " " + N((h - size * 0.72) / 2) + " Td (" + txt + ") Tj ET ";
+            // Circled, like a hand-drawn reference number.
+            double size = txt.size() > 1 ? 9.5 : 11.5, tw = TextWidth(txt, size);
+            body = "q 1.3 w " + Ellipse(w / 2, h / 2, 9, 9) + "Q BT /HeBo " + N(size) + " Tf " +
+                   N((w - tw) / 2) + " " + N((h - size * 0.72) / 2) + " Td (" + txt + ") Tj ET ";
         }
 
         const Rgb &c = kColors[(gSettings.color >= 0 && gSettings.color < ColorCount()) ? gSettings.color : 0];
         double scale = kSizeScales[(gSettings.size >= 0 && gSettings.size < 3) ? gSettings.size : 1];
         std::string rgb = N(c.r) + " " + N(c.g) + " " + N(c.b);
-        std::string ops = "q " + N(scale) + " 0 0 " + N(scale) + " 0 0 cm " + N(kLineWidth) + " w 1 J 1 j " +
-                          rgb + " RG " + rgb + " rg " + body + "Q";
 
-        double W = w * scale, H = h * scale;
         int rotate = (int)PDPageGetRotate(page);
         bool sideways = (rotate == 90 || rotate == 270);
 
-        ASFixedPoint pt;
-        AVPageViewDevicePointToPage(pageView, x, y, &pt);
-        double px = ASFixedToFloat(pt.h), py = ASFixedToFloat(pt.v);
+        // A drag while placing sets the size: the mark fills the dragged box's height, keeping its shape.
+        double dragW = 0, dragH = 0;
+        if (dragged) {
+            dragW = ASFixedToFloat(dragged->right) - ASFixedToFloat(dragged->left);
+            dragH = ASFixedToFloat(dragged->top) - ASFixedToFloat(dragged->bottom);
+            if (sideways) { double t = dragW; dragW = dragH; dragH = t; }
+            if (dragW < 0) dragW = -dragW;
+            if (dragH < 0) dragH = -dragH;
+            if (dragH >= 4 || dragW >= 4)
+                scale = (dragH >= 4) ? dragH / h : dragW / w;
+        }
+        std::string ops = "q " + N(scale) + " 0 0 " + N(scale) + " 0 0 cm " + N(kLineWidth) + " w 1 J 1 j " +
+                          rgb + " RG " + rgb + " rg " + body + "Q";
+        double W = w * scale, H = h * scale;
+
+        double px, py;
+        if (dragged && (dragH >= 4 || dragW >= 4)) {
+            px = (ASFixedToFloat(dragged->left) + ASFixedToFloat(dragged->right)) / 2;
+            py = (ASFixedToFloat(dragged->top) + ASFixedToFloat(dragged->bottom)) / 2;
+        } else {
+            ASFixedPoint pt;
+            AVPageViewDevicePointToPage(pageView, x, y, &pt);
+            px = ASFixedToFloat(pt.h);
+            py = ASFixedToFloat(pt.v);
+        }
         double rw = sideways ? H : W, rh = sideways ? W : H;
         ASFixedRect rect;
         rect.left   = FloatToASFixed(px - rw / 2);
@@ -309,7 +326,6 @@ bool PlaceMark(AVPageView pageView, AVDevCoord x, AVDevCoord y, MarkMode mode)
         CosDictPutKeyString(a, "F", CosNewInteger(cd, false, 4));          // print
         CosDictPutKeyString(a, "Name", CosNewNameFromString(cd, false, ("Tickmark_" + id).c_str()));
         PutString(a, "Subj", "Tickmark");
-        PutString(a, "Contents", label);
         std::string now = PdfDateNow();
         PutString(a, "CreationDate", now);
         PutString(a, "M", now);
