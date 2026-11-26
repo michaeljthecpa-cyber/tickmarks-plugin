@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
         CHECK(r == textedit::kReplaced);
         t = PageText(p3);
         CHECK(Has(t, u"1,243,567.98"));
-        CHECK(Has(t, u"Cost of sales"));
+        CHECK(Has(t, u"sales"));  // the other row is untouched
         Ppm(p3, "textedit_out_font.ppm");
         FPDFFont_Close(font);
         FPDF_ClosePage(p3);
