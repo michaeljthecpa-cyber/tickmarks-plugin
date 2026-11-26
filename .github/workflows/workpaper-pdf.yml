@@ -33,12 +33,19 @@ jobs:
           cmake -S . -B build -A x64
           cmake --build build --config Release --parallel
 
+      - name: Unit tests
+        shell: pwsh
+        run: |
+          Copy-Item build\Release\pdfium.dll build\Release\tests\ -ErrorAction SilentlyContinue
+          build\Release\ops_test.exe tests\sample-60-pages.pdf
+          if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
+
       - name: Speed check
         shell: pwsh
         run: |
-          $p = Start-Process build\Release\WorkpaperPDF.exe -ArgumentList '--benchmark', "$PWD\tests\sample-60-pages.pdf", "$PWD\speed.txt" -Wait -PassThru
+          Start-Process build\Release\WorkpaperPDF.exe -ArgumentList '--benchmark', "$PWD\tests\sample-60-pages.pdf", "$PWD\speed.txt" -Wait
           Get-Content speed.txt
-          if ($p.ExitCode -ne 0) { throw "benchmark failed" }
+          if (-not (Select-String -Path speed.txt -Pattern '^pages=60$' -Quiet)) { throw "benchmark failed" }
           "## Speed check (60-page sample)" | Out-File -Append $env:GITHUB_STEP_SUMMARY
           Get-Content speed.txt | ForEach-Object { "- $_" } | Out-File -Append $env:GITHUB_STEP_SUMMARY
 
