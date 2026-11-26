@@ -37,7 +37,7 @@
 #include "resource.h"
 
 #define APP_NAME L"Workpaper PDF"
-#define APP_VERSION L"0.5.0 (build 5)"
+#define APP_VERSION L"0.6.0 (build 6)"
 static const wchar_t* kMainClass = L"WorkpaperPDFMain";
 static const wchar_t* kViewClass = L"WorkpaperPDFView";
 static const wchar_t* kThumbClass = L"WorkpaperPDFThumbs";
@@ -51,7 +51,7 @@ enum {
     ID_ABOUT, ID_SHORTCUTS, ID_SAVE, ID_SAVEAS, ID_UNDO, ID_REDO, ID_ROTR, ID_ROTL, ID_DUP, ID_DEL,
     ID_INSERTFILE, ID_INSERTBLANK, ID_EXTRACT, ID_SELECTALL, ID_MARKSPANE, ID_TOOL_HAND, ID_TOOL_SELECT,
     ID_TOOL_TICK, ID_TOOL_NUMBER, ID_TOOL_LETTER, ID_TOOL_HIGHLIGHT, ID_TOOL_NOTE, ID_TOOL_BOX, ID_TOOL_OVAL, ID_TOOL_PEN, ID_TOOL_ADDTEXT, ID_TOOL_EDITTEXT,
-    ID_AUTOINC, ID_DELANNOT, ID_FIND, ID_FINDNEXT, ID_FINDPREV, ID_PRINT, ID_PRINTCLEAN, ID_SIDE_PAGES, ID_SIDE_OUTLINE, ID_SIDE_COMMENTS, ID_PAGEEDIT = 300, ID_TABS = 301, ID_STATUS = 302, ID_FINDEDIT = 303, ID_NAVLIST = 304,
+    ID_AUTOINC, ID_DELANNOT, ID_FIND, ID_FINDNEXT, ID_FINDPREV, ID_PRINT, ID_PRINTCLEAN, ID_SIDE_PAGES, ID_SIDE_OUTLINE, ID_SIDE_COMMENTS, ID_GUIDE, ID_DEFAULTAPP, ID_EDITLINE, ID_EDITPARA, ID_PAGEEDIT = 300, ID_TABS = 301, ID_STATUS = 302, ID_FINDEDIT = 303, ID_NAVLIST = 304,
 };
 #define WM_APP_RENDER (WM_APP + 1)
 
@@ -812,6 +812,7 @@ struct MarkSettings {
     int textFamily = 0;  // Add text: 0 sans, 1 serif, 2 mono
     int textBold = 0;
     int textSize = 10;   // points
+    int editPara = 0;    // Edit text picks a line (0) or a whole paragraph (1)
 };
 static MarkSettings g_ms;
 static HWND g_marks;  // the Marks pane on the right
@@ -823,7 +824,7 @@ static void LoadMarkSettings() {
     struct { const wchar_t* name; int* p; } f[] = {{L"Kind", &g_ms.kind}, {L"Symbol", &g_ms.symbol}, {L"Color", &g_ms.color},
         {L"Size", &g_ms.size}, {L"AutoIncrement", &g_ms.autoInc}, {L"Wrap", &g_ms.wrap}, {L"NextNumber", &g_ms.nextNumber},
         {L"NextLetter", &g_ms.nextLetter}, {L"TextFamily", &g_ms.textFamily}, {L"TextBold", &g_ms.textBold},
-        {L"TextSize", &g_ms.textSize}};
+        {L"TextSize", &g_ms.textSize}, {L"EditParagraph", &g_ms.editPara}};
     for (auto& x : f) if (RegGetDword(L"Marks", x.name, v)) *x.p = (int)v;
     g_ms.textFamily = std::clamp(g_ms.textFamily, 0, 2);
     g_ms.textSize = std::clamp(g_ms.textSize, 6, 36);
@@ -839,7 +840,7 @@ static void SaveMarkSettings() {
     struct { const wchar_t* name; int v; } f[] = {{L"Kind", g_ms.kind}, {L"Symbol", g_ms.symbol}, {L"Color", g_ms.color},
         {L"Size", g_ms.size}, {L"AutoIncrement", g_ms.autoInc}, {L"Wrap", g_ms.wrap}, {L"NextNumber", g_ms.nextNumber},
         {L"NextLetter", g_ms.nextLetter}, {L"TextFamily", g_ms.textFamily}, {L"TextBold", g_ms.textBold},
-        {L"TextSize", g_ms.textSize}};
+        {L"TextSize", g_ms.textSize}, {L"EditParagraph", g_ms.editPara}};
     for (auto& x : f) RegSetDword(L"Marks", x.name, (DWORD)x.v);
     RegSetDword(nullptr, L"MarksPane", g_showMarks ? 1 : 0);
 }
@@ -929,7 +930,7 @@ static void SetTool(int tool) {
         L"Oval: drag to draw an oval, for example around an amount.",
         L"Pen: draw freehand. Each stroke is saved as you go.",
         L"Add text: click where the text should start, then type. Enter starts a new line; click away or Ctrl+Enter to finish.",
-        L"Edit text: click a line (or a table cell) to retype it. Enter to finish, Esc to cancel. Empty it to delete the text.",
+        L"Edit text: click a line (or a table cell) to retype it. Switch to Paragraph in the Marks pane to retype a whole paragraph. Enter to finish, Esc to cancel.",
     };
     g_g.hoverOn = false;
     if (Cur()) SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)(std::wstring(L"  ") + hints[tool]).c_str());
@@ -1136,7 +1137,9 @@ static struct {
     Tab* tab = nullptr;
     int page = -1;
     bool replace = false;     // retyping existing text (else adding new text)
+    bool para = false;        // retyping a whole paragraph
     textedit::Line line;      // the run being retyped
+    textedit::Paragraph paragraph;
     std::wstring before;
     COLORREF color = 0;
     int ascent = 0;           // pixels from the box top to the first baseline
@@ -1145,6 +1148,12 @@ static struct {
 
 static void FitTextEditor() {
     if (!g_textEdit) return;
+    if (g_te.para) {
+        // Fixed width (the paragraph's), growing downwards as the text wraps.
+        int lines = (int)SendMessageW(g_textEdit, EM_GETLINECOUNT, 0, 0);
+        SetWindowPos(g_textEdit, nullptr, 0, 0, g_te.minW, std::max(1, lines) * g_te.lineH + S(6), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return;
+    }
     int len = GetWindowTextLengthW(g_textEdit);
     std::wstring text(len, L'\0');
     GetWindowTextW(g_textEdit, &text[0], len + 1);
@@ -1190,7 +1199,21 @@ static void CommitText(bool cancel) {
     FPDF_PAGE p = FPDF_LoadPage(t->pdf.Handle(), page);
     if (!p) return;
     std::u16string u = ToU16(clean);
-    if (g_te.replace) {
+    if (g_te.para) {
+        int used = 0;
+        textedit::Result r = textedit::ReplaceParagraph(t->pdf.Handle(), p, g_te.paragraph, u, &used);
+        FPDF_ClosePage(p);
+        if (r == textedit::kFailed) {
+            t->undo.pop_back();
+            MessageBoxW(g_main, L"This paragraph could not be changed. Try editing it line by line instead.", APP_NAME, MB_ICONINFORMATION);
+            return;
+        }
+        SearchChanged();
+        std::wstring msg = r == textedit::kReplaced ? L"  Paragraph changed." : L"  Paragraph changed (old text covered and retyped).";
+        if (used > (int)g_te.paragraph.lines.size())
+            msg += L" It is now longer than before, so check that it doesn't run into what's below (Ctrl+Z undoes).";
+        SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)msg.c_str());
+    } else if (g_te.replace) {
         textedit::Result r = textedit::ReplaceLine(t->pdf.Handle(), p, g_te.line, u);
         FPDF_ClosePage(p);
         if (r == textedit::kFailed) {
@@ -1227,9 +1250,9 @@ static HFONT MakeTextFont(int family, bool bold, bool italic, int px) {
 }
 
 // Shows the editor with its top-left at `at` (view coordinates).
-static void ShowTextEditor(Tab* t, int page, POINT at, int minW, const std::wstring& text, bool multiline) {
+static void ShowTextEditor(Tab* t, int page, POINT at, int minW, const std::wstring& text, bool multiline, bool wrap = false) {
     if (g_textEdit) DestroyWindow(g_textEdit);
-    DWORD style = WS_CHILD | ES_AUTOHSCROLL | (multiline ? ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL : 0);
+    DWORD style = WS_CHILD | (wrap ? ES_MULTILINE | ES_AUTOVSCROLL : ES_AUTOHSCROLL | (multiline ? ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL : 0));
     g_textEdit = CreateWindowExW(0, L"EDIT", L"", style, 0, 0, 0, 0, g_view, nullptr, g_inst, nullptr);
     if (!g_whiteBrush) g_whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
     SendMessageW(g_textEdit, WM_SETFONT, (WPARAM)g_textFont, FALSE);
@@ -1260,6 +1283,7 @@ static void StartAddText(Tab* t, int page, POINT v) {
     marks::ColorRgb(g_ms.color, r, g, b);
     g_te.color = RGB(r, g, b);
     g_te.replace = false;
+    g_te.para = false;
     if (g_textFont) DeleteObject(g_textFont);
     g_textFont = MakeTextFont(g_ms.textFamily, g_ms.textBold != 0, false, (int)lround(g_ms.textSize * t->scale));
     ShowTextEditor(t, page, POINT{v.x - S(2), v.y - S(1)}, S(60), L"", true);
@@ -1278,7 +1302,43 @@ static bool RunAt(Tab* t, int page, POINT v, textedit::Line& ln, RECT& view) {
     return ok;
 }
 
+static bool ParaAt(Tab* t, int page, POINT v, textedit::Paragraph& para, RECT& view) {
+    FPDF_PAGE p = FPDF_LoadPage(t->pdf.Handle(), page);
+    if (!p) return false;
+    double x, y;
+    ToPage(t, p, page, v, x, y);
+    bool ok = textedit::ParagraphAt(p, x, y, 3 / t->scale + 1, para);
+    if (ok) {
+        view = RectToView(t, p, page, annots::Rect{(float)para.left, (float)para.lines.back().bottom, (float)para.right,
+                                                    (float)para.lines.front().top});
+    }
+    FPDF_ClosePage(p);
+    return ok;
+}
+
+static void StartEditParagraph(Tab* t, int page, POINT v) {
+    textedit::Paragraph para;
+    RECT vr;
+    if (!ParaAt(t, page, v, para, vr)) {
+        SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)L"  There is no text there to edit. If the page is a scan, use Add text instead.");
+        return;
+    }
+    const textedit::Line& ln = para.lines[0];
+    g_te.line = ln;
+    g_te.paragraph = para;
+    g_te.replace = true;
+    g_te.para = true;
+    g_te.color = ln.invisible ? RGB(0, 0, 0) : RGB(ln.r, ln.g, ln.b);
+    if (g_textFont) DeleteObject(g_textFont);
+    g_textFont = MakeTextFont(ln.family, ln.bold, ln.italic, (int)lround(ln.size * t->scale));
+    // Wrap the editor at the paragraph's width so the lines break about where they will on the page.
+    ShowTextEditor(t, page, POINT{vr.left - S(3), vr.top - S(2)}, vr.right - vr.left + S(10), ToW(para.text), true, true);
+    SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)L"  Retype the paragraph, then press Enter. The lines re-wrap to fit. Esc cancels.");
+}
+
 static void StartEditText(Tab* t, int page, POINT v) {
+    if (g_ms.editPara) { StartEditParagraph(t, page, v); return; }
+    g_te.para = false;
     textedit::Line ln;
     RECT vr;
     if (!RunAt(t, page, v, ln, vr)) {
@@ -1318,7 +1378,8 @@ static void UpdateEditHover(Tab* t, POINT v) {
     RECT old = g_g.hover;
     int page = PageAt(t, v);
     textedit::Line ln;
-    g_g.hoverOn = page >= 0 && RunAt(t, page, v, ln, g_g.hover);
+    textedit::Paragraph para;
+    g_g.hoverOn = page >= 0 && (g_ms.editPara ? ParaAt(t, page, v, para, g_g.hover) : RunAt(t, page, v, ln, g_g.hover));
     if (was != g_g.hoverOn || (g_g.hoverOn && !EqualRect(&old, &g_g.hover))) InvalidateRect(g_view, nullptr, FALSE);
 }
 
@@ -1897,6 +1958,18 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
         label(plus, L"+", RGB(0x24, 0x29, 0x33));
         y += bh + S(10);
     }
+    heading(L"Edit text picks");
+    {
+        int gap = S(4), bh = S(26), bw = (width - gap) / 2;
+        static const wchar_t* modes[2] = {L"A line", L"A paragraph"};
+        for (int i = 0; i < 2; i++) {
+            RECT r = {x0 + i * (bw + gap), y, x0 + i * (bw + gap) + bw, y + bh};
+            bool hot = hit(r, 17, i, i ? L"Retype a whole paragraph; the lines re-wrap" : L"Retype one line or table cell");
+            PaneButton(hdc, r, g_ms.editPara == i, hot);
+            label(r, modes[i], RGB(0x24, 0x29, 0x33));
+        }
+        y += bh + S(10);
+    }
     // Shortcut reminder.
     RECT hr = {x0, y, x0 + width, y + S(110)};
     g_paneContentH = y + S(116) + g_paneScroll;
@@ -1927,6 +2000,7 @@ static void PaneAction(const PaneHit& h) {
     case 14: g_ms.textBold = !g_ms.textBold; break;
     case 15: g_ms.textSize = std::max(6, g_ms.textSize - (g_ms.textSize > 12 ? 2 : 1)); break;
     case 16: g_ms.textSize = std::min(36, g_ms.textSize + (g_ms.textSize >= 12 ? 2 : 1)); break;
+    case 17: g_ms.editPara = h.arg; g_g.hoverAt = POINT{-1000, -1000}; SetTool(kEditText); break;
     }
     SaveMarkSettings();
     InvalidateRect(g_marks, nullptr, FALSE);
@@ -3278,7 +3352,7 @@ static void RelayoutMain() {
     MoveWindow(g_tabs, 0, toolH, rc.right, tabH, TRUE);
     int y = toolH + tabH;
     int h = std::max(0, (int)rc.bottom - statusH - y);
-    int thumbW = g_showThumbs ? (g_sideMode ? S(250) : S(190)) : 0;
+    int thumbW = g_showThumbs ? (g_sideMode ? S(250) : S(212)) : 0;
     int sideH = S(30);
     ShowWindow(g_side, g_showThumbs ? SW_SHOW : SW_HIDE);
     MoveWindow(g_side, 0, y, thumbW, sideH, TRUE);
@@ -3340,10 +3414,13 @@ static void ShowShortcuts() {
                 L"Zoom in / out\tCtrl+plus / Ctrl+minus, Ctrl+wheel\n"
                 L"Actual size\tCtrl+0\n"
                 L"Fit width / fit page\tCtrl+1 / Ctrl+2\n"
-                L"Page thumbnails\tF4\n"
+                L"Side pane\tF4\n"
                 L"Marks pane\tF6\n"
                 L"Tickmark / number / letter\tK / N / L\n"
                 L"Highlight / select / hand\tH / S / Esc\n"
+                L"Add text / edit text\tT / E\n"
+                L"Search / next / previous\tCtrl+F / F3 / Shift+F3\n"
+                L"Print\tCtrl+P\n"
                 L"Delete selected mark\tDel\n"
                 L"Save / Save as\tCtrl+S / Ctrl+Shift+S\n"
                 L"Undo / redo\tCtrl+Z / Ctrl+Y\n"
@@ -3480,6 +3557,28 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_TOOL_OVAL: SetTool(kOval); break;
         case ID_TOOL_PEN: SetTool(kPen); break;
         case ID_TOOL_ADDTEXT: SetTool(kAddText); break;
+        case ID_EDITLINE: g_ms.editPara = 0; SaveMarkSettings(); SetTool(kEditText); break;
+        case ID_EDITPARA: g_ms.editPara = 1; SaveMarkSettings(); SetTool(kEditText); break;
+        case ID_GUIDE: {
+            wchar_t exe[MAX_PATH * 2];
+            GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+            std::wstring dir = exe;
+            dir = dir.substr(0, dir.find_last_of(L"\\"));
+            std::wstring guide = dir + L"\\README.txt";
+            if (GetFileAttributesW(guide.c_str()) == INVALID_FILE_ATTRIBUTES)
+                MessageBoxW(h, L"The guide (README.txt) wasn't found next to the app. Ask whoever gave you the installer for a copy.", APP_NAME, MB_ICONINFORMATION);
+            else
+                ShellExecuteW(h, L"open", L"notepad.exe", (L"\"" + guide + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+            break;
+        }
+        case ID_DEFAULTAPP:
+            MessageBoxW(h, L"Windows asks you to choose the default app yourself.\n\nOn the page that opens, set .pdf to Workpaper PDF. "
+                           L"(If it isn't listed, choose \u201CChoose an app on your PC\u201D, or right-click any PDF > Open with > "
+                           L"Choose another app > Workpaper PDF > Always.)",
+                        APP_NAME, MB_ICONINFORMATION);
+            if ((INT_PTR)ShellExecuteW(h, L"open", L"ms-settings:defaultapps?registeredAppUser=Workpaper%20PDF", nullptr, nullptr, SW_SHOWNORMAL) <= 32)
+                ShellExecuteW(h, L"open", L"ms-settings:defaultapps", nullptr, nullptr, SW_SHOWNORMAL);
+            break;
         case ID_FIND: SetFocus(g_findEdit); SendMessageW(g_findEdit, EM_SETSEL, 0, -1); break;
         case ID_FINDNEXT: DoFind(false); break;
         case ID_FINDPREV: DoFind(true); break;
@@ -3561,6 +3660,8 @@ static HMENU BuildMenu() {
     AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(tools, MF_STRING, ID_TOOL_ADDTEXT, L"Add te&xt\tT");
     AppendMenuW(tools, MF_STRING, ID_TOOL_EDITTEXT, L"&Edit text\tE");
+    AppendMenuW(tools, MF_STRING, ID_EDITLINE, L"Edit text picks a &line");
+    AppendMenuW(tools, MF_STRING, ID_EDITPARA, L"Edit text picks a &paragraph");
     AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(tools, MF_STRING, ID_MARKSPANE, L"Show marks &pane\tF6");
     AppendMenuW(file, MF_STRING, ID_OPEN, L"&Open...\tCtrl+O");
@@ -3603,7 +3704,11 @@ static HMENU BuildMenu() {
     AppendMenuW(view, MF_STRING, ID_SIDE_COMMENTS, L"Side pane: &comments list");
     AppendMenuW(view, MF_STRING, ID_NEXTTAB, L"Next tab\tCtrl+Tab");
     AppendMenuW(view, MF_STRING, ID_PREVTAB, L"Previous tab\tCtrl+Shift+Tab");
+    AppendMenuW(help, MF_STRING, ID_GUIDE, L"&Quick guide");
     AppendMenuW(help, MF_STRING, ID_SHORTCUTS, L"&Keyboard shortcuts");
+    AppendMenuW(help, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(help, MF_STRING, ID_DEFAULTAPP, L"Make Workpaper PDF the &default PDF app...");
+    AppendMenuW(help, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(help, MF_STRING, ID_ABOUT, L"&About " APP_NAME);
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&File");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)edit, L"&Edit");

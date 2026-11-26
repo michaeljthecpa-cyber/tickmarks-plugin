@@ -47,6 +47,11 @@ Root: HKCU; Subkey: "Software\Classes\WorkpaperPDF.Document\DefaultIcon"; ValueT
 Root: HKCU; Subkey: "Software\Classes\WorkpaperPDF.Document\shell\open\command"; ValueType: string; ValueData: """{app}\WorkpaperPDF.exe"" ""%1"""; Tasks: pdfassoc
 Root: HKCU; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "WorkpaperPDF.Document"; ValueData: ""; Flags: uninsdeletevalue; Tasks: pdfassoc
 Root: HKCU; Subkey: "Software\Classes\Applications\WorkpaperPDF.exe\SupportedTypes"; ValueType: string; ValueName: ".pdf"; ValueData: ""; Flags: uninsdeletekey; Tasks: pdfassoc
+; Lists the app under Settings > Apps > Default apps, so it can be made the default PDF app there.
+Root: HKCU; Subkey: "Software\WorkpaperPDF\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "Workpaper PDF"; Flags: uninsdeletekey; Tasks: pdfassoc
+Root: HKCU; Subkey: "Software\WorkpaperPDF\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "A fast PDF app for audit workpapers"; Tasks: pdfassoc
+Root: HKCU; Subkey: "Software\WorkpaperPDF\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pdf"; ValueData: "WorkpaperPDF.Document"; Tasks: pdfassoc
+Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "Workpaper PDF"; ValueData: "Software\WorkpaperPDF\Capabilities"; Flags: uninsdeletevalue; Tasks: pdfassoc
 
 [Run]
 Filename: "{app}\WorkpaperPDF.exe"; Description: "Start Workpaper PDF now"; Flags: nowait postinstall skipifsilent

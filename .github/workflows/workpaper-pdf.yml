@@ -100,7 +100,8 @@ jobs:
           Compress-Archive -Path dist\WorkpaperPDF\* -DestinationPath dist\WorkpaperPDF-portable.zip -Force
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
-          & $iscc /Qp "/DSourceDir=..\build\Release" installer\WorkpaperPDF.iss
+          $ver = (Select-String -Path src\main.cpp -Pattern 'APP_VERSION L"([0-9.]+)').Matches[0].Groups[1].Value
+          & $iscc /Qp "/DSourceDir=..\build\Release" "/DAppVersion=$ver" installer\WorkpaperPDF.iss
           if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
           Get-ChildItem dist
 

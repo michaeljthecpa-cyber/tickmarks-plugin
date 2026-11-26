@@ -2,7 +2,11 @@
 
 A fast PDF app for audit workpapers. Opens in a blink, no account, no auto-updates, no background services.
 
-**This is build 5.** It views, searches and prints PDFs, organizes pages, adds tickmarks and comments, and edits text.
+**This is build 6**, the first full team release. It views, searches and prints PDFs, organizes pages,
+adds tickmarks and comments, and edits text.
+
+**Quick start:** open a PDF (drag it on, or Ctrl+O). Press F6 for the Marks pane, pick a tickmark, click the page.
+Press E and click a line to fix text. Ctrl+S saves. Help > Quick guide opens this guide.
 
 ## Install
 
@@ -14,7 +18,8 @@ A fast PDF app for audit workpapers. Opens in a blink, no account, no auto-updat
 
 If your antivirus or IT blocks it, ask Michael. Only run installers from the firm's own link.
 
-To make Workpaper PDF your default PDF app: right-click any PDF, choose **Open with > Choose another app**,
+To make Workpaper PDF your default PDF app: in the app choose **Help > Make Workpaper PDF the default PDF app**
+and set .pdf on the Windows page that opens. Or right-click any PDF, choose **Open with > Choose another app**,
 pick **Workpaper PDF** and tick **Always**.
 
 No installer? The zip version runs without installing: unzip it anywhere and run `WorkpaperPDF.exe`.
@@ -87,7 +92,9 @@ Open the **Marks** pane on the right with the **Marks** button or F6.
   (some fonts only carry the letters already used), the old text is covered with white and retyped in the
   closest standard font, sized to match. Either way, Ctrl+Z undoes it.
 - Text in a scanned page is a picture, not real text, so it can't be retyped. Use Add text to write the correction next to it.
-- Editing a whole paragraph so the lines re-flow is coming in a later build.
+- **Whole paragraphs:** under **Edit text picks** in the Marks pane, choose **A paragraph**. Pointing now outlines
+  the whole paragraph; click it, retype, press Enter, and the lines re-wrap to the paragraph's width at the same
+  spacing. If your new text is longer, check it doesn't run into what's below (Ctrl+Z undoes).
 
 ## Uninstall
 

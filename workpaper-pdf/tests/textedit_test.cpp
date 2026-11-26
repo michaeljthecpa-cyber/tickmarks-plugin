@@ -157,6 +157,49 @@ int main(int argc, char** argv) {
         FPDF_ClosePage(p3);
     }
 
+    // 8. A paragraph: found as a block, retyped longer, and re-wrapped to the same width.
+    {
+        FPDF_PAGE pp = FPDFPage_New(d, FPDF_GetPageCount(d), 612, 792);
+        const char16_t* para[] = {u"The client reconciles the operating account each month and the",
+                                  u"controller reviews the reconciliation. We agreed the balance to the",
+                                  u"bank confirmation without exception."};
+        for (int k = 0; k < 3; k++) {
+            FPDF_PAGEOBJECT o = FPDFPageObj_NewTextObj(d, "Times-Roman", 11);
+            std::u16string z = para[k];
+            z.push_back(0);
+            FPDFText_SetText(o, (FPDF_WIDESTRING)z.c_str());
+            FPDFPageObj_Transform(o, 1, 0, 0, 1, 72, 600 - k * 13.5);
+            FPDFPage_InsertObject(pp, o);
+        }
+        FPDF_PAGEOBJECT h = FPDFPageObj_NewTextObj(d, "Helvetica-Bold", 14);
+        FPDFText_SetText(h, (FPDF_WIDESTRING)u"Cash procedures");
+        FPDFPageObj_Transform(h, 1, 0, 0, 1, 72, 630);
+        FPDFPage_InsertObject(pp, h);
+        FPDF_PAGEOBJECT after = FPDFPageObj_NewTextObj(d, "Times-Roman", 11);
+        FPDFText_SetText(after, (FPDF_WIDESTRING)u"Conclusion: cash is fairly stated.");
+        FPDFPageObj_Transform(after, 1, 0, 0, 1, 72, 520);
+        FPDFPage_InsertObject(pp, after);
+        FPDFPage_GenerateContent(pp);
+        CHECK(Find(pp, u"controller", x, y));
+        textedit::Paragraph para2;
+        CHECK(textedit::ParagraphAt(pp, x, y, 2, para2));
+        printf("paragraph: %zu lines, leading %.1f: '%s'\n", para2.lines.size(), para2.leading, Utf8(para2.text).c_str());
+        CHECK(para2.lines.size() == 3);
+        CHECK(para2.text.find(u"month and the controller") != std::u16string::npos);
+        std::u16string longer = para2.text + u" We also tested the bank reconciliation for the last month of the year and traced reconciling items to subsequent statements.";
+        int used = 0;
+        int r = textedit::ReplaceParagraph(d, pp, para2, longer, &used);
+        printf("paragraph replace -> %d, %d lines\n", r, used);
+        CHECK(r != textedit::kFailed);
+        CHECK(used >= 4);
+        t = PageText(pp);
+        CHECK(Has(t, u"subsequent statements"));
+        CHECK(Has(t, u"Cash procedures"));
+        CHECK(Has(t, u"Conclusion"));
+        Ppm(pp, "textedit_out_para.ppm");
+        FPDF_ClosePage(pp);
+    }
+
     // Save and reload: the edits survive.
     std::vector<uint8_t> out;
     CHECK(ops::SaveToBuffer(d, out));

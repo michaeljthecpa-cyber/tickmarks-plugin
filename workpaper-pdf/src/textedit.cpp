@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <functional>
 #include <map>
 #include <set>
 #include <vector>
@@ -94,9 +95,7 @@ const char* StandardFont(int family, bool bold, bool italic) {
     return names[f][(bold ? 1 : 0) + (italic ? 2 : 0)];
 }
 
-bool LineAt(FPDF_PAGE page, double x, double y, double tol, Line& out) {
-    FPDF_TEXTPAGE tp = FPDFText_LoadPage(page);
-    if (!tp) return false;
+static bool LineAtTP(FPDF_TEXTPAGE tp, double x, double y, double tol, Line& out) {
     int n = FPDFText_CountChars(tp);
     int hit = FPDFText_GetCharIndexAtPos(tp, x, y, tol, tol);
     // Clicking a space or line end: step to a neighbouring real character.
@@ -108,7 +107,6 @@ bool LineAt(FPDF_PAGE page, double x, double y, double tol, Line& out) {
         }
     }
     if (hit < 0 || hit >= n || IsBreak(FPDFText_GetUnicode(tp, hit))) {
-        FPDFText_ClosePage(tp);
         return false;
     }
     double size = FPDFText_GetFontSize(tp, hit);
@@ -166,7 +164,6 @@ bool LineAt(FPDF_PAGE page, double x, double y, double tol, Line& out) {
         }
     }
     if (!any) {
-        FPDFText_ClosePage(tp);
         return false;
     }
     unsigned int r, g, b, a;
@@ -185,8 +182,15 @@ bool LineAt(FPDF_PAGE page, double x, double y, double tol, Line& out) {
         out.family = kSerif;
     FPDF_PAGEOBJECT obj = FPDFText_GetTextObject(tp, hit);
     out.invisible = obj && FPDFTextObj_GetTextRenderMode(obj) == FPDF_TEXTRENDERMODE_INVISIBLE;
-    FPDFText_ClosePage(tp);
     return true;
+}
+
+bool LineAt(FPDF_PAGE page, double x, double y, double tol, Line& out) {
+    FPDF_TEXTPAGE tp = FPDFText_LoadPage(page);
+    if (!tp) return false;
+    bool ok = LineAtTP(tp, x, y, tol, out);
+    FPDFText_ClosePage(tp);
+    return ok;
 }
 
 bool AddText(FPDF_DOCUMENT doc, FPDF_PAGE page, const std::u16string& text, double x, double y, double size,
@@ -266,26 +270,65 @@ bool ReadsBack(FPDF_PAGE page, const std::vector<std::pair<FPDF_PAGEOBJECT, std:
 
 }  // namespace
 
-Result ReplaceLine(FPDF_DOCUMENT doc, FPDF_PAGE page, const Line& line, const std::u16string& text) {
+namespace {
+
+// Splits text into lines no wider than `width` (measured by `measure`); \n forces a break.
+std::vector<std::u16string> Wrap(const std::u16string& text, double width, const std::function<double(const std::u16string&)>& measure) {
+    std::vector<std::u16string> out;
+    for (auto& para : SplitLines(text)) {
+        std::vector<std::u16string> words;
+        std::u16string w;
+        for (char16_t c : para) {
+            if (c == u' ') { if (!w.empty()) words.push_back(w); w.clear(); }
+            else w.push_back(c);
+        }
+        if (!w.empty()) words.push_back(w);
+        if (words.empty()) { out.emplace_back(); continue; }
+        std::u16string line;
+        for (auto& word : words) {
+            std::u16string tryLine = line.empty() ? word : line + u" " + word;
+            if (!line.empty() && measure(tryLine) > width) {
+                out.push_back(line);
+                line = word;
+            } else {
+                line = tryLine;
+            }
+        }
+        out.push_back(line);
+    }
+    return out;
+}
+
+Result ReplaceRuns(FPDF_DOCUMENT doc, FPDF_PAGE page, const std::vector<Line>& runs, const std::u16string& text, bool wrap,
+                   double wrapWidth, double leading, int* linesUsed) {
+    if (runs.empty()) return kFailed;
+    const Line& line = runs[0];
     FPDF_TEXTPAGE tp = FPDFText_LoadPage(page);
     if (!tp) return kFailed;
     int n = FPDFText_CountChars(tp);
-    if (line.first < 0 || line.first + line.count > n) {
-        FPDFText_ClosePage(tp);
-        return kFailed;
-    }
-    auto inRun = [&](int i) { return i >= line.first && i < line.first + line.count; };
-    // The text objects the run touches, in page order.
+    for (auto& r : runs)
+        if (r.first < 0 || r.first + r.count > n) {
+            FPDFText_ClosePage(tp);
+            return kFailed;
+        }
+    auto inRun = [&](int i) {
+        for (auto& r : runs) if (i >= r.first && i < r.first + r.count) return true;
+        return false;
+    };
+    bool invisible = false;
+    for (auto& r : runs) invisible = invisible || r.invisible;
+    // The text objects the runs touch, in page order.
     std::vector<FPDF_PAGEOBJECT> objs;
-    for (int i = line.first; i < line.first + line.count; i++) {
-        FPDF_PAGEOBJECT o = FPDFText_GetTextObject(tp, i);
-        if (o && std::find(objs.begin(), objs.end(), o) == objs.end()) objs.push_back(o);
-    }
-    bool clean = !line.invisible && !objs.empty();
+    for (auto& r : runs)
+        for (int i = r.first; i < r.first + r.count; i++) {
+            FPDF_PAGEOBJECT o = FPDFText_GetTextObject(tp, i);
+            if (o && std::find(objs.begin(), objs.end(), o) == objs.end()) objs.push_back(o);
+        }
+    bool clean = !invisible && !objs.empty();
     for (FPDF_PAGEOBJECT o : objs)
         if (ObjectIndex(page, o) < 0) clean = false;
 
-    // Text outside the run that shares an object with it is rebuilt, word by word, at its exact position.
+    // Text outside the runs that shares an object with them is rebuilt, word by word, at its exact position.
     struct Piece { FPDF_PAGEOBJECT obj; std::u16string text; FPDF_PAGEOBJECT from; };
     std::vector<Piece> pieces;
     std::vector<std::pair<FPDF_PAGEOBJECT, std::u16string>> check;
@@ -305,11 +348,8 @@ Result ReplaceLine(FPDF_DOCUMENT doc, FPDF_PAGE page, const Line& line, const st
                 word.clear();
             };
             for (int i = 0; i < n && clean; i++) {
-                if (FPDFText_GetTextObject(tp, i) != o || FPDFText_IsGenerated(tp, i)) {
-                    if (FPDFText_GetTextObject(tp, i) != o) continue;
-                    flush();  // a generated space or line break separates words
-                    continue;
-                }
+                if (FPDFText_GetTextObject(tp, i) != o) continue;
+                if (FPDFText_IsGenerated(tp, i)) { flush(); continue; }  // a generated space or line break separates words
                 unsigned int c = FPDFText_GetUnicode(tp, i);
                 if (inRun(i) || c == ' ' || c > 0xFFFF) { flush(); continue; }
                 if (word.empty()) FPDFText_GetCharOrigin(tp, i, &wx, &wy);
@@ -319,49 +359,82 @@ Result ReplaceLine(FPDF_DOCUMENT doc, FPDF_PAGE page, const Line& line, const st
         }
     }
 
-    // The new text: in the original font when it has every character, otherwise a close standard font.
-    FPDF_PAGEOBJECT neu = nullptr;
-    if (!text.empty()) {
-        FPDF_FONT font = clean ? FPDFTextObj_GetFont(objs[0]) : nullptr;
-        if (font) {
-            std::set<unsigned int> have;
-            for (int i = 0; i < n; i++) {
-                FPDF_PAGEOBJECT o = FPDFText_GetTextObject(tp, i);
-                if (o && FPDFTextObj_GetFont(o) == font) have.insert(FPDFText_GetUnicode(tp, i));
-            }
-            for (char16_t ch : text)
-                if (ch != u' ' && !have.count(ch)) { font = nullptr; break; }
+    // The font for the new text: the original when it has every character, otherwise a close standard font.
+    FPDF_FONT font = clean ? FPDFTextObj_GetFont(objs[0]) : nullptr;
+    if (font) {
+        std::set<unsigned int> have;
+        for (int i = 0; i < n; i++) {
+            FPDF_PAGEOBJECT o = FPDFText_GetTextObject(tp, i);
+            if (o && FPDFTextObj_GetFont(o) == font) have.insert(FPDFText_GetUnicode(tp, i));
         }
-        if (font) {
-            neu = CloneStyle(doc, objs[0], font, text, line.ox, line.oy);
-            if (neu && !ReadsBack(page, {{neu, text}})) {
-                FPDFPageObj_Destroy(neu);
-                neu = nullptr;
-            }
+        for (char16_t ch : text)
+            if (ch != u' ' && ch != u'\n' && ch != u'\r' && !have.count(ch)) { font = nullptr; break; }
+    }
+    if (font) {
+        std::u16string probeText;
+        for (char16_t ch : text) if (ch != u'\n' && ch != u'\r') probeText.push_back(ch);
+        FPDF_PAGEOBJECT probe = probeText.empty() ? nullptr : CloneStyle(doc, objs[0], font, probeText, 0, 0);
+        if (!probeText.empty() && (!probe || !ReadsBack(page, {{probe, probeText}}))) font = nullptr;
+        if (probe) FPDFPageObj_Destroy(probe);
+    }
+    // Stand-in font: match the width of the original lettering by comparing the old text set in it.
+    double hscale = 1;
+    if (!font) {
+        std::u16string old;
+        double want = 0;
+        for (auto& r : runs) {
+            old += r.text;
+            want += std::fabs((r.right - r.left) * std::cos(r.angle)) + std::fabs((r.top - r.bottom) * std::sin(r.angle));
         }
-        if (!neu) {
-            neu = NewStandardText(doc, text, line.size, line.family, line.bold, line.italic);
-            if (neu) {
-                // Match the width of the original lettering: compare the old text set in the stand-in font.
-                double hscale = 1;
-                FPDF_PAGEOBJECT probe = NewStandardText(doc, line.text, line.size, line.family, line.bold, line.italic);
-                if (probe) {
-                    double want = std::fabs((line.right - line.left) * std::cos(line.angle)) +
-                                  std::fabs((line.top - line.bottom) * std::sin(line.angle));
-                    double got = ObjWidth(probe);
-                    if (got > 1 && want > 1) hscale = std::clamp(want / got, 0.8, 1.15);
-                    FPDFPageObj_Destroy(probe);
-                }
-                Place(neu, line.ox, line.oy, line.angle, hscale);
-                FPDFPageObj_SetFillColor(neu, line.r, line.g, line.b, 255);
-            }
+        FPDF_PAGEOBJECT probe = NewStandardText(doc, old, line.size, line.family, line.bold, line.italic);
+        if (probe) {
+            double got = ObjWidth(probe);
+            if (got > 1 && want > 1) hscale = std::clamp(want / got, 0.8, 1.15);
+            FPDFPageObj_Destroy(probe);
         }
-        if (!neu) {
+    }
+    auto make = [&](const std::u16string& s, double x, double y) -> FPDF_PAGEOBJECT {
+        if (font) return CloneStyle(doc, objs[0], font, s, x, y);
+        FPDF_PAGEOBJECT o = NewStandardText(doc, s, line.size, line.family, line.bold, line.italic);
+        if (!o) return nullptr;
+        Place(o, x, y, line.angle, hscale);
+        FPDFPageObj_SetFillColor(o, line.r, line.g, line.b, 255);
+        return o;
+    };
+    auto measure = [&](const std::u16string& s) -> double {
+        FPDF_PAGEOBJECT o = make(s, 0, 0);
+        if (!o) return 0;
+        float l, b, r, t;
+        double w = FPDFPageObj_GetBounds(o, &l, &b, &r, &t) ? std::hypot(r - l, 0.0) : 0;
+        if (std::fabs(std::sin(line.angle)) > 0.5) w = t - b;
+        FPDFPageObj_Destroy(o);
+        return w;
+    };
+
+    // Lay out the new text: one line where the run was, or wrapped to the paragraph's width.
+    std::vector<std::u16string> lines;
+    if (!text.empty()) lines = wrap ? Wrap(text, wrapWidth, measure) : std::vector<std::u16string>{text};
+    std::vector<FPDF_PAGEOBJECT> neu;
+    double c = std::cos(line.angle), s = std::sin(line.angle);
+    for (size_t k = 0; k < lines.size(); k++) {
+        if (lines[k].empty()) continue;
+        // Later lines start where the paragraph's second line started (keeps a first-line indent).
+        double x0 = line.ox, y0 = line.oy, down = 0;
+        if (k > 0) {
+            if (runs.size() > 1) { x0 = runs[1].ox; y0 = runs[1].oy; down = (k - 1) * leading; }
+            else down = k * leading;
+        }
+        double dx = down * s, dy = -down * c;
+        FPDF_PAGEOBJECT o = make(lines[k], x0 + dx, y0 + dy);
+        if (!o) {
+            for (auto p : neu) FPDFPageObj_Destroy(p);
             for (auto& p : pieces) FPDFPageObj_Destroy(p.obj);
             FPDFText_ClosePage(tp);
             return kFailed;
         }
+        neu.push_back(o);
     }
+    if (linesUsed) *linesUsed = (int)lines.size();
     if (clean && !ReadsBack(page, check)) clean = false;
     FPDFText_ClosePage(tp);
 
@@ -379,21 +452,122 @@ Result ReplaceLine(FPDF_DOCUMENT doc, FPDF_PAGE page, const Line& line, const st
         for (auto& p : pieces) FPDFPageObj_Destroy(p.obj);
         res = kCovered;
         double pad = 0.8;
-        FPDF_PAGEOBJECT box = FPDFPageObj_CreateNewRect((float)(line.left - pad), (float)(line.bottom - pad),
-                                                        (float)(line.right - line.left + 2 * pad),
-                                                        (float)(line.top - line.bottom + 2 * pad));
-        if (!box) {
-            if (neu) FPDFPageObj_Destroy(neu);
-            return kFailed;
+        for (auto& r : runs) {
+            FPDF_PAGEOBJECT box = FPDFPageObj_CreateNewRect((float)(r.left - pad), (float)(r.bottom - pad),
+                                                            (float)(r.right - r.left + 2 * pad), (float)(r.top - r.bottom + 2 * pad));
+            if (!box) continue;
+            FPDFPageObj_SetFillColor(box, 255, 255, 255, 255);
+            FPDFPath_SetDrawMode(box, FPDF_FILLMODE_WINDING, 0);
+            FPDFPage_InsertObject(page, box);
         }
-        FPDFPageObj_SetFillColor(box, 255, 255, 255, 255);
-        FPDFPath_SetDrawMode(box, FPDF_FILLMODE_WINDING, 0);
-        FPDFPage_InsertObject(page, box);
-        if (neu && line.invisible) FPDFTextObj_SetTextRenderMode(neu, FPDF_TEXTRENDERMODE_FILL);
+        if (invisible)
+            for (auto o : neu) FPDFTextObj_SetTextRenderMode(o, FPDF_TEXTRENDERMODE_FILL);
     }
-    if (neu) FPDFPage_InsertObject(page, neu);
+    for (auto o : neu) FPDFPage_InsertObject(page, o);
     if (!FPDFPage_GenerateContent(page)) return kFailed;
     return res;
+}
+
+}  // namespace
+
+Result ReplaceLine(FPDF_DOCUMENT doc, FPDF_PAGE page, const Line& line, const std::u16string& text) {
+    return ReplaceRuns(doc, page, {line}, text, false, 0, 0, nullptr);
+}
+
+static bool ParagraphAtTP(FPDF_TEXTPAGE tp, double x, double y, double tol, Paragraph& out);
+
+bool ParagraphAt(FPDF_PAGE page, double x, double y, double tol, Paragraph& out) {
+    FPDF_TEXTPAGE tp = FPDFText_LoadPage(page);
+    if (!tp) return false;
+    bool ok = ParagraphAtTP(tp, x, y, tol, out);
+    FPDFText_ClosePage(tp);
+    return ok;
+}
+
+static bool ParagraphAtTP(FPDF_TEXTPAGE tp, double x, double y, double tol, Paragraph& out) {
+    Line hit;
+    if (!LineAtTP(tp, x, y, tol, hit)) return false;
+    out = Paragraph();
+    out.lines.push_back(hit);
+    if (std::fabs(std::sin(hit.angle)) > 0.01 || std::cos(hit.angle) < 0) {
+        // Only level text is grouped into paragraphs; sideways text is edited line by line.
+        out.left = hit.left; out.right = hit.right; out.leading = hit.size * 1.2;
+        out.text = hit.text;
+        return true;
+    }
+    // Look for the lines above and below: same size, same left edge (the first line may be indented),
+    // and the same spacing between lines.
+    auto probe = [&](double py, Line& ln) {
+        for (double dx : {0.5, 2.0, 6.0, 15.0}) {
+            if (LineAtTP(tp, out.left + dx, py, 1.0, ln)) return true;
+        }
+        return false;
+    };
+    out.left = hit.left;
+    out.right = hit.right;
+    double leading = 0;
+    auto similar = [&](const Line& a, const Line& b) {
+        return std::fabs(a.size - b.size) < a.size * 0.12 && std::fabs(a.angle - b.angle) < 0.01 && a.bold == b.bold;
+    };
+    auto findNext = [&](const Line& from, int dir, Line& ln) -> bool {
+        // Scan across one to two line heights for the neighbouring line's middle.
+        for (double step = from.size * 0.9; step <= from.size * 2.2; step += from.size * 0.15) {
+            double py = (from.bottom + from.top) / 2 + dir * step;
+            Line cand;
+            if (!LineAtTP(tp, from.left + 1, py, 1.0, cand) && !probe(py, cand)) continue;
+            if (cand.first == from.first) continue;
+            if (!similar(cand, hit)) return false;
+            double gap = std::fabs(cand.oy - from.oy);
+            if (leading > 0 && std::fabs(gap - leading) > hit.size * 0.25) return false;
+            // Left edges line up (a first-line indent of up to 4 em is allowed).
+            if (std::fabs(cand.left - out.left) > hit.size * 4) return false;
+            ln = cand;
+            if (leading == 0) leading = gap;
+            return true;
+        }
+        return false;
+    };
+    Line cur = hit, ln;
+    while (out.lines.size() < 60 && findNext(cur, 1, ln)) {
+        // A shorter line above usually ends the previous paragraph.
+        if (ln.right < out.right - hit.size * 6 && out.lines.size() >= 1) break;
+        out.lines.insert(out.lines.begin(), ln);
+        cur = ln;
+    }
+    cur = hit;
+    while (out.lines.size() < 60 && findNext(cur, -1, ln)) {
+        out.lines.push_back(ln);
+        cur = ln;
+        // A short line is the paragraph's last.
+        if (ln.right < out.right - hit.size * 6) break;
+    }
+    out.left = out.right = 0;
+    bool first = true;
+    for (auto& l : out.lines) {
+        if (first) { out.left = l.left; out.right = l.right; first = false; }
+        out.left = std::min(out.left, l.left);
+        out.right = std::max(out.right, l.right);
+    }
+    out.leading = leading > 0 ? leading : hit.size * 1.2;
+    for (size_t k = 0; k < out.lines.size(); k++) {
+        std::u16string t = out.lines[k].text;
+        if (k > 0) {
+            // Join lines with a space, or mend a word split with a hyphen at the line end.
+            if (!out.text.empty() && out.text.back() == u'-' && out.text.size() > 1 && out.text[out.text.size() - 2] != u' ')
+                out.text.pop_back();
+            else
+                out.text.push_back(u' ');
+        }
+        out.text += t;
+    }
+    return true;
+}
+
+Result ReplaceParagraph(FPDF_DOCUMENT doc, FPDF_PAGE page, const Paragraph& para, const std::u16string& text, int* linesUsed) {
+    if (para.lines.empty()) return kFailed;
+    double width = para.right - para.lines[0].ox;
+    if (para.lines.size() > 1) width = std::max(width, para.right - para.lines[1].ox);
+    return ReplaceRuns(doc, page, para.lines, text, true, width + 0.5, para.leading, linesUsed);
 }
 
 }  // namespace textedit

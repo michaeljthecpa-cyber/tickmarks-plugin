@@ -3,6 +3,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 #include "fpdfview.h"
 
 namespace textedit {
@@ -41,5 +42,20 @@ enum Result { kFailed = 0, kReplaced, kCovered };
 // with a white box and retyped on top (kCovered). Empty `text` deletes the run.
 // The caller must reload any text page it holds for this page afterwards.
 Result ReplaceLine(FPDF_DOCUMENT doc, FPDF_PAGE page, const Line& line, const std::u16string& text);
+
+// A paragraph: neighbouring lines with the same size and left edge, evenly spaced.
+struct Paragraph {
+    std::vector<Line> lines;   // top to bottom
+    double left = 0, right = 0;
+    double leading = 0;        // baseline to baseline
+    std::u16string text;       // the lines joined with spaces (hyphenated line ends mended)
+};
+
+// Finds the paragraph around page point (x, y).
+bool ParagraphAt(FPDF_PAGE page, double x, double y, double tol, Paragraph& out);
+
+// Replaces a paragraph with new text, re-wrapped to the paragraph's width at the same line spacing.
+// The text may run onto more or fewer lines than before (reported in *linesUsed).
+Result ReplaceParagraph(FPDF_DOCUMENT doc, FPDF_PAGE page, const Paragraph& para, const std::u16string& text, int* linesUsed);
 
 }  // namespace textedit
