@@ -35,14 +35,19 @@
 #include <shlobj.h>
 #include <functional>
 #include "resource.h"
+#include "theme.h"
+#include <dwmapi.h>
+#include <uxtheme.h>
 
 #define APP_NAME L"Workpaper PDF"
-#define APP_VERSION L"0.6.0 (build 6)"
+#define APP_VERSION L"0.7.0 (build 7)"
 static const wchar_t* kMainClass = L"WorkpaperPDFMain";
 static const wchar_t* kViewClass = L"WorkpaperPDFView";
 static const wchar_t* kThumbClass = L"WorkpaperPDFThumbs";
 static const wchar_t* kSideClass = L"WorkpaperPDFSide";
 static const wchar_t* kToolClass = L"WorkpaperPDFToolbar";
+static const wchar_t* kTabsClass = L"WorkpaperPDFTabs";
+static const wchar_t* kStatusClass = L"WorkpaperPDFStatus";
 static const wchar_t* kRegKey = L"Software\\WorkpaperPDF";
 
 enum {
@@ -51,9 +56,11 @@ enum {
     ID_ABOUT, ID_SHORTCUTS, ID_SAVE, ID_SAVEAS, ID_UNDO, ID_REDO, ID_ROTR, ID_ROTL, ID_DUP, ID_DEL,
     ID_INSERTFILE, ID_INSERTBLANK, ID_EXTRACT, ID_SELECTALL, ID_MARKSPANE, ID_TOOL_HAND, ID_TOOL_SELECT,
     ID_TOOL_TICK, ID_TOOL_NUMBER, ID_TOOL_LETTER, ID_TOOL_HIGHLIGHT, ID_TOOL_NOTE, ID_TOOL_BOX, ID_TOOL_OVAL, ID_TOOL_PEN, ID_TOOL_ADDTEXT, ID_TOOL_EDITTEXT,
-    ID_AUTOINC, ID_DELANNOT, ID_FIND, ID_FINDNEXT, ID_FINDPREV, ID_PRINT, ID_PRINTCLEAN, ID_SIDE_PAGES, ID_SIDE_OUTLINE, ID_SIDE_COMMENTS, ID_GUIDE, ID_DEFAULTAPP, ID_EDITLINE, ID_EDITPARA, ID_PAGEEDIT = 300, ID_TABS = 301, ID_STATUS = 302, ID_FINDEDIT = 303, ID_NAVLIST = 304,
+    ID_AUTOINC, ID_DELANNOT, ID_FIND, ID_FINDNEXT, ID_FINDPREV, ID_PRINT, ID_PRINTCLEAN, ID_SIDE_PAGES, ID_SIDE_OUTLINE, ID_SIDE_COMMENTS, ID_GUIDE, ID_DEFAULTAPP, ID_EDITLINE, ID_EDITPARA, ID_MENU, ID_THEME_SYS, ID_THEME_LIGHT, ID_THEME_DARK, ID_ZOOMMENU, ID_ZOOMPRESET,
+    ID_ZOOMPRESET_LAST = ID_ZOOMPRESET + 20, ID_PAGEEDIT = 300, ID_TABS = 301, ID_STATUS = 302, ID_FINDEDIT = 303, ID_NAVLIST = 304,
 };
 #define WM_APP_RENDER (WM_APP + 1)
+#define WM_APP_CLOSETAB (WM_APP + 2)
 
 // ---------------------------------------------------------------- state
 
@@ -106,7 +113,14 @@ static std::vector<std::unique_ptr<Tab>> g_docs;
 static int g_cur = -1;
 static bool g_showThumbs = true;
 static bool g_renderPosted = false;
-static HFONT g_font, g_iconFont, g_bigFont;
+static HFONT g_font, g_iconFont, g_bigFont, g_smallFont, g_headFont, g_titleFont, g_btnFont, g_logoFont;
+static std::wstring g_iconFace = L"Segoe MDL2 Assets";
+static Palette g_c = LightPalette();
+static bool g_dark = false;
+static int g_themePref = 0, g_themeOverride = -1;  // 0 follow Windows, 1 light, 2 dark
+static HBRUSH g_inputBrush, g_surfaceBrush;
+static HMENU g_menu;
+static std::vector<std::wstring> g_recent;
 static UINT g_dpi = 96;
 static HACCEL g_accel;
 static bool g_dragging = false;
@@ -134,6 +148,94 @@ static bool RegGetDword(const wchar_t* sub, const std::wstring& name, DWORD& v) 
     std::wstring key = std::wstring(kRegKey) + (sub ? std::wstring(L"\\") + sub : L"");
     DWORD sz = sizeof(v);
     return RegGetValueW(HKEY_CURRENT_USER, key.c_str(), name.c_str(), RRF_RT_REG_DWORD, nullptr, &v, &sz) == 0;
+}
+
+// Recently opened files, newest first, for the start screen.
+static void LoadRecent() {
+    g_recent.clear();
+    std::wstring key = std::wstring(kRegKey) + L"\\Recent";
+    for (int i = 0; i < 12; i++) {
+        wchar_t buf[MAX_PATH * 4];
+        DWORD sz = sizeof(buf);
+        if (RegGetValueW(HKEY_CURRENT_USER, key.c_str(), std::to_wstring(i).c_str(), RRF_RT_REG_SZ, nullptr, buf, &sz) == 0 && buf[0])
+            g_recent.push_back(buf);
+    }
+}
+static void SaveRecent() {
+    std::wstring key = std::wstring(kRegKey) + L"\\Recent";
+    RegDeleteTreeW(HKEY_CURRENT_USER, key.c_str());
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) != 0) return;
+    for (size_t i = 0; i < g_recent.size(); i++)
+        RegSetValueExW(k, std::to_wstring(i).c_str(), 0, REG_SZ, (const BYTE*)g_recent[i].c_str(), (DWORD)((g_recent[i].size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(k);
+}
+static void AddRecent(const std::wstring& path) {
+    if (path.empty()) return;
+    g_recent.erase(std::remove_if(g_recent.begin(), g_recent.end(), [&](const std::wstring& r) { return _wcsicmp(r.c_str(), path.c_str()) == 0; }),
+                   g_recent.end());
+    g_recent.insert(g_recent.begin(), path);
+    if (g_recent.size() > 12) g_recent.resize(12);
+    SaveRecent();
+}
+
+// ---------------------------------------------------------------- theme
+
+static bool SystemUsesDark() {
+    DWORD v = 1, sz = sizeof(v);
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"AppsUseLightTheme",
+                 RRF_RT_REG_DWORD, nullptr, &v, &sz);
+    return v == 0;
+}
+
+// Dark menus and scroll bars use uxtheme entry points that Windows exports by number only.
+static void UxDarkMode(HWND w, bool dark) {
+    static HMODULE ux = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!ux) return;
+    typedef int(WINAPI * SetMode)(int);
+    typedef BOOL(WINAPI * AllowWnd)(HWND, BOOL);
+    typedef void(WINAPI * Flush)();
+    static auto setMode = (SetMode)GetProcAddress(ux, MAKEINTRESOURCEA(135));
+    static auto allow = (AllowWnd)GetProcAddress(ux, MAKEINTRESOURCEA(133));
+    static auto flush = (Flush)GetProcAddress(ux, MAKEINTRESOURCEA(136));
+    OSVERSIONINFOW ov = {sizeof(ov)};
+    // Only on Windows 10 1903 and later, where these numbers mean what we expect.
+    typedef LONG(WINAPI * RtlVer)(OSVERSIONINFOW*);
+    static auto rtl = (RtlVer)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    if (rtl) rtl(&ov);
+    if (ov.dwBuildNumber < 18362) return;
+    if (!w) {
+        if (setMode) setMode(dark ? 2 : 3);
+        if (flush) flush();
+    } else if (allow) {
+        allow(w, dark);
+    }
+}
+
+static void ApplyTheme() {
+    int pref = g_themeOverride >= 0 ? g_themeOverride : g_themePref;
+    g_dark = pref == 2 || (pref == 0 && SystemUsesDark());
+    g_c = g_dark ? DarkPalette() : LightPalette();
+    if (g_inputBrush) DeleteObject(g_inputBrush);
+    if (g_surfaceBrush) DeleteObject(g_surfaceBrush);
+    g_inputBrush = CreateSolidBrush(g_c.input);
+    g_surfaceBrush = CreateSolidBrush(g_c.surface);
+    UxDarkMode(nullptr, g_dark);
+    if (!g_main) return;
+    BOOL d = g_dark;
+    DwmSetWindowAttribute(g_main, 20, &d, sizeof(d));  // dark title bar
+    // Windows 11: colour the title bar like the toolbar so the top of the window reads as one piece.
+    COLORREF cap = g_c.surface, txt = g_c.text, brd = g_c.border;
+    DwmSetWindowAttribute(g_main, 35, &cap, sizeof(cap));
+    DwmSetWindowAttribute(g_main, 36, &txt, sizeof(txt));
+    DwmSetWindowAttribute(g_main, 34, &brd, sizeof(brd));
+    for (HWND w : {g_view, g_navList, g_thumbs}) {
+        if (!w) continue;
+        UxDarkMode(w, g_dark);
+        SetWindowTheme(w, g_dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        SendMessageW(w, WM_THEMECHANGED, 0, 0);
+    }
+    RedrawWindow(g_main, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
 }
 
 // ---------------------------------------------------------------- layout
@@ -262,18 +364,19 @@ static void UpdateStatus() {
         return;
     }
     int page = CurrentPage(t);
-    SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)(L"  " + t->pdf.Path()).c_str());
+    SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)(L"  " + (t->pdf.Path().empty() ? t->pdf.Title() : t->pdf.Path())).c_str());
     swprintf(buf, 512, L"Page %d of %d", page + 1, t->pdf.PageCount());
     SendMessageW(g_status, SB_SETTEXTW, 1, (LPARAM)buf);
     swprintf(buf, 512, L"%d%%", (int)lround(t->zoom * 100));
     SendMessageW(g_status, SB_SETTEXTW, 2, (LPARAM)buf);
-    swprintf(buf, 512, L"Opened in %.0f ms", t->openMs);
+    swprintf(buf, 512, t->openMs > 0 ? L"Opened in %.0f ms" : L"", t->openMs);
     SendMessageW(g_status, SB_SETTEXTW, 3, (LPARAM)buf);
     if (GetFocus() != g_pageEdit) {
         swprintf(buf, 512, L"%d", page + 1);
         SetWindowTextW(g_pageEdit, buf);
     }
     SetWindowTextW(g_main, (t->pdf.Title() + (t->dirty ? L" *" : L"") + L" - " APP_NAME).c_str());
+    InvalidateRect(g_tool, nullptr, FALSE);
     if (page != g_lastShownPage) {
         g_lastShownPage = page;
         EnsureThumbVisible(t, page);
@@ -396,6 +499,230 @@ static void GoToPage(Tab* t, int page) {
     Refresh(false);
 }
 
+// ---------------------------------------------------------------- tab strip (custom drawn; answers the TCM_ messages we use)
+
+static struct {
+    std::vector<std::wstring> titles;
+    std::vector<bool> dirty;
+    std::vector<RECT> rc, closeRc;
+    RECT plus{};
+    int cur = -1, hot = -1, hotClose = -1;
+    bool hotPlus = false;
+} g_tb;
+
+static void LayoutTabs(HWND h) {
+    RECT rc;
+    GetClientRect(h, &rc);
+    HDC dc = GetDC(h);
+    HGDIOBJ of = SelectObject(dc, g_font);
+    int n = (int)g_tb.titles.size(), x = S(8), top = S(5), bottom = rc.bottom - S(5);
+    std::vector<int> w(n);
+    int total = 0;
+    for (int i = 0; i < n; i++) {
+        SIZE sz;
+        GetTextExtentPoint32W(dc, g_tb.titles[i].c_str(), (int)g_tb.titles[i].size(), &sz);
+        w[i] = std::clamp((int)sz.cx + S(76), S(130), S(250));
+        total += w[i] + S(4);
+    }
+    int avail = rc.right - S(56);
+    if (total > avail && n) for (auto& v : w) v = std::max(S(96), avail / n - S(4));
+    g_tb.rc.assign(n, RECT{});
+    g_tb.closeRc.assign(n, RECT{});
+    for (int i = 0; i < n; i++) {
+        g_tb.rc[i] = {x, top, x + w[i], bottom};
+        int c = (top + bottom) / 2;
+        g_tb.closeRc[i] = {x + w[i] - S(30), c - S(11), x + w[i] - S(8), c + S(11)};
+        x += w[i] + S(4);
+    }
+    int c = (top + bottom) / 2;
+    g_tb.plus = {x + S(2), c - S(14), x + S(30), c + S(14)};
+    SelectObject(dc, of);
+    ReleaseDC(h, dc);
+}
+
+static LRESULT CALLBACK TabsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case TCM_DELETEALLITEMS:
+        g_tb.titles.clear();
+        g_tb.dirty.clear();
+        LayoutTabs(h);
+        InvalidateRect(h, nullptr, FALSE);
+        return TRUE;
+    case TCM_INSERTITEMW: {
+        TCITEMW* it = (TCITEMW*)l;
+        std::wstring t = it && it->pszText ? it->pszText : L"";
+        bool dirty = t.size() > 2 && t.compare(t.size() - 2, 2, L" *") == 0;
+        if (dirty) t.resize(t.size() - 2);
+        int at = std::clamp((int)w, 0, (int)g_tb.titles.size());
+        g_tb.titles.insert(g_tb.titles.begin() + at, t);
+        g_tb.dirty.insert(g_tb.dirty.begin() + at, dirty);
+        LayoutTabs(h);
+        InvalidateRect(h, nullptr, FALSE);
+        return at;
+    }
+    case TCM_SETCURSEL: { int old = g_tb.cur; g_tb.cur = (int)w; InvalidateRect(h, nullptr, FALSE); return old; }
+    case TCM_GETCURSEL: return g_tb.cur;
+    case TCM_GETITEMCOUNT: return (LRESULT)g_tb.titles.size();
+    case TCM_GETITEMRECT:
+        if ((int)w < 0 || (int)w >= (int)g_tb.rc.size()) return FALSE;
+        *(RECT*)l = g_tb.rc[w];
+        return TRUE;
+    case TCM_HITTEST: {
+        TCHITTESTINFO* hi = (TCHITTESTINFO*)l;
+        for (int i = 0; i < (int)g_tb.rc.size(); i++) if (PtInRect(&g_tb.rc[i], hi->pt)) return i;
+        return -1;
+    }
+    case WM_SIZE: LayoutTabs(h); InvalidateRect(h, nullptr, FALSE); return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        HDC buf = CreateCompatibleDC(hdc);
+        HBITMAP bb = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HGDIOBJ ob = SelectObject(buf, bb);
+        FillSolid(buf, rc, g_c.chrome);
+        FillSolid(buf, RECT{0, rc.bottom - 1, rc.right, rc.bottom}, g_c.border);
+        SetBkMode(buf, TRANSPARENT);
+        for (int i = 0; i < (int)g_tb.rc.size(); i++) {
+            RECT r = g_tb.rc[i];
+            bool cur = i == g_tb.cur, hot = i == g_tb.hot;
+            if (cur) RoundRectAA(buf, r, (float)S(8), g_c.surface, g_c.border);
+            else if (hot) RoundRectAA(buf, r, (float)S(8), g_c.hover);
+            RECT ic = {r.left + S(10), r.top, r.left + S(30), r.bottom};
+            SelectObject(buf, g_iconFont);
+            SetTextColor(buf, cur ? g_c.accent : g_c.muted);
+            DrawTextW(buf, L"\xE8A5", -1, &ic, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            RECT tr = {r.left + S(36), r.top, g_tb.closeRc[i].left - S(4), r.bottom};
+            SelectObject(buf, g_font);
+            SetTextColor(buf, cur ? g_c.text : g_c.text2);
+            DrawTextW(buf, g_tb.titles[i].c_str(), -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            RECT cr = g_tb.closeRc[i];
+            if (g_tb.dirty[i] && !(hot || cur)) {
+                // Unsaved: a dot where the close button sits.
+                int cx = (cr.left + cr.right) / 2, cy = (cr.top + cr.bottom) / 2;
+                EllipseAA(buf, RECT{cx - S(4), cy - S(4), cx + S(4), cy + S(4)}, g_c.accent);
+            } else if (hot || cur) {
+                if (i == g_tb.hotClose) EllipseAA(buf, cr, g_c.pressed);
+                SelectObject(buf, g_smallFont);
+                SetTextColor(buf, g_tb.dirty[i] && i != g_tb.hotClose ? g_c.accent : g_c.text2);
+                DrawTextW(buf, g_tb.dirty[i] && i != g_tb.hotClose ? L"\x25CF" : L"\x2715", -1, &cr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            }
+        }
+        if (!g_tb.titles.empty()) {
+            if (g_tb.hotPlus) RoundRectAA(buf, g_tb.plus, (float)S(8), g_c.hover);
+            SelectObject(buf, g_iconFont);
+            SetTextColor(buf, g_c.text2);
+            DrawTextW(buf, L"\xE710", -1, &g_tb.plus, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        }
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, buf, 0, 0, SRCCOPY);
+        SelectObject(buf, ob);
+        DeleteObject(bb);
+        DeleteDC(buf);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        POINT p = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+        int hot = -1, hc = -1;
+        for (int i = 0; i < (int)g_tb.rc.size(); i++)
+            if (PtInRect(&g_tb.rc[i], p)) { hot = i; if (PtInRect(&g_tb.closeRc[i], p)) hc = i; }
+        bool hp = PtInRect(&g_tb.plus, p) != 0;
+        if (hot != g_tb.hot || hc != g_tb.hotClose || hp != g_tb.hotPlus) {
+            g_tb.hot = hot;
+            g_tb.hotClose = hc;
+            g_tb.hotPlus = hp;
+            InvalidateRect(h, nullptr, FALSE);
+            TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, h, 0};
+            TrackMouseEvent(&tme);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_tb.hot = g_tb.hotClose = -1;
+        g_tb.hotPlus = false;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN: {
+        POINT p = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+        if (PtInRect(&g_tb.plus, p)) { SendMessageW(g_main, WM_COMMAND, ID_OPEN, 0); return 0; }
+        for (int i = 0; i < (int)g_tb.rc.size(); i++) {
+            if (!PtInRect(&g_tb.rc[i], p)) continue;
+            if (PtInRect(&g_tb.closeRc[i], p)) { PostMessageW(g_main, WM_APP_CLOSETAB, i, 0); return 0; }
+            if (i != g_tb.cur) {
+                g_tb.cur = i;
+                NMHDR nm = {h, (UINT_PTR)ID_TABS, (UINT)TCN_SELCHANGE};
+                SendMessageW(GetParent(h), WM_NOTIFY, ID_TABS, (LPARAM)&nm);
+            }
+            return 0;
+        }
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// ---------------------------------------------------------------- status bar (custom drawn; answers SB_SETTEXT)
+
+static std::wstring g_statusText[4];
+
+static LRESULT CALLBACK StatusProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case SB_SETTEXTW: {
+        int i = LOWORD(w) & 0xFF;
+        if (i < 0 || i > 3) return FALSE;
+        std::wstring t = l ? (const wchar_t*)l : L"";
+        size_t a = t.find_first_not_of(L' ');
+        t = a == std::wstring::npos ? L"" : t.substr(a);
+        if (t != g_statusText[i]) {
+            g_statusText[i] = t;
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return TRUE;
+    }
+    case SB_SETPARTS: return TRUE;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        HDC buf = CreateCompatibleDC(hdc);
+        HBITMAP bb = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HGDIOBJ ob = SelectObject(buf, bb);
+        FillSolid(buf, rc, g_c.surface);
+        FillSolid(buf, RECT{0, 0, rc.right, 1}, g_c.border);
+        SetBkMode(buf, TRANSPARENT);
+        SelectObject(buf, g_smallFont);
+        // Right side: page, zoom and timing, separated by dots.
+        int x = rc.right - S(14);
+        for (int i = 3; i >= 1; i--) {
+            if (g_statusText[i].empty()) continue;
+            SIZE sz;
+            GetTextExtentPoint32W(buf, g_statusText[i].c_str(), (int)g_statusText[i].size(), &sz);
+            RECT r = {x - sz.cx, 0, x, rc.bottom};
+            SetTextColor(buf, i == 1 ? g_c.text2 : g_c.muted);
+            DrawTextW(buf, g_statusText[i].c_str(), -1, &r, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+            x -= sz.cx + S(10);
+            int cy = rc.bottom / 2;
+            if (i > 1) EllipseAA(buf, RECT{x - S(2), cy - S(2), x + S(2), cy + S(2)}, g_c.muted);
+            x -= S(10);
+        }
+        RECT lr = {S(14), 0, x - S(12), rc.bottom};
+        SetTextColor(buf, g_c.text2);
+        DrawTextW(buf, g_statusText[0].c_str(), -1, &lr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, buf, 0, 0, SRCCOPY);
+        SelectObject(buf, ob);
+        DeleteObject(bb);
+        DeleteDC(buf);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
 static void RebuildTabStrip() {
     TabCtrl_DeleteAllItems(g_tabs);
     for (size_t i = 0; i < g_docs.size(); i++) {
@@ -443,6 +770,7 @@ static void OpenFile(const std::wstring& path) {
     QueryPerformanceCounter(&b);
     t->openMs = (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
     g_docs.push_back(std::move(t));
+    AddRecent(path);
     bool first = g_docs.size() == 1;
     RebuildTabStrip();
     if (first) RelayoutMain();
@@ -1676,7 +2004,7 @@ static void PaintOverlay(HDC hdc, Tab* t) {
     if (g_ms.tool == kEditText && g_g.hoverOn && !(g_textEdit && IsWindowVisible(g_textEdit))) {
         RECT r = g_g.hover;
         InflateRect(&r, S(3), S(2));
-        HPEN pen = CreatePen(PS_DOT, 1, RGB(0x1F, 0x6F, 0xEB));
+        HPEN pen = CreatePen(PS_DOT, 1, g_c.accent);
         HGDIOBJ op = SelectObject(hdc, pen), ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
         SetBkMode(hdc, TRANSPARENT);
         Rectangle(hdc, r.left, r.top, r.right, r.bottom);
@@ -1687,7 +2015,7 @@ static void PaintOverlay(HDC hdc, Tab* t) {
     if (!g_g.selNm.empty() && g_g.selPage >= 0 && g_g.selPage < t->pdf.PageCount()) {
         RECT r = SelViewRect(t);
         InflateRect(&r, S(3), S(3));
-        HPEN pen = CreatePen(PS_DASH, 1, RGB(0x1F, 0x6F, 0xEB));
+        HPEN pen = CreatePen(PS_DASH, 1, g_c.accent);
         HGDIOBJ op = SelectObject(hdc, pen), ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
         SetBkMode(hdc, TRANSPARENT);
         Rectangle(hdc, r.left, r.top, r.right, r.bottom);
@@ -1696,7 +2024,7 @@ static void PaintOverlay(HDC hdc, Tab* t) {
         DeleteObject(pen);
         if (g_g.selSubtype == FPDF_ANNOT_STAMP || g_g.selSubtype == FPDF_ANNOT_SQUARE || g_g.selSubtype == FPDF_ANNOT_CIRCLE) {
             RECT hnd = {r.right - S(5), r.bottom - S(5), r.right + S(3), r.bottom + S(3)};
-            HBRUSH hb = CreateSolidBrush(RGB(0x1F, 0x6F, 0xEB));
+            HBRUSH hb = CreateSolidBrush(g_c.accent);
             FillRect(hdc, &hnd, hb);
             DeleteObject(hb);
         }
@@ -1740,7 +2068,7 @@ static HBITMAP RenderMarkIcon(marks::Kind kind, int symbol, const std::string& t
     HBITMAP hb = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (hb && p) {
         FPDF_BITMAP fb = FPDFBitmap_CreateEx(bw, bh, FPDFBitmap_BGRx, bits, bw * 4);
-        FPDFBitmap_FillRect(fb, 0, 0, bw, bh, 0xFFFFFFFF);
+        FPDFBitmap_FillRect(fb, 0, 0, bw, bh, 0xFF000000 | (GetRValue(g_c.surface) << 16) | (GetGValue(g_c.surface) << 8) | GetBValue(g_c.surface));
         FPDF_RenderPageBitmap(fb, p, 0, 0, bw, bh, 0, FPDF_ANNOT);
         FPDFBitmap_Destroy(fb);
     }
@@ -1752,7 +2080,9 @@ static HBITMAP RenderMarkIcon(marks::Kind kind, int symbol, const std::string& t
 
 static void EnsureSymbolIcons() {
     int px = S(24);
-    if (g_symIconColor == g_ms.color && g_symIconSize == px && (int)g_symIcons.size() == marks::SymbolCount()) return;
+    static COLORREF bgWas = CLR_INVALID;
+    if (g_symIconColor == g_ms.color && g_symIconSize == px && bgWas == g_c.surface && (int)g_symIcons.size() == marks::SymbolCount()) return;
+    bgWas = g_c.surface;
     for (auto b : g_symIcons) if (b) DeleteObject(b);
     g_symIcons.clear();
     for (int i = 0; i < marks::SymbolCount(); i++) g_symIcons.push_back(RenderMarkIcon(marks::kSymbol, i, "", g_ms.color, px));
@@ -1768,44 +2098,36 @@ static void DrawBitmapCentered(HDC hdc, HBITMAP b, const RECT& r) {
     SelectObject(mem, b);
     int w = std::min<int>(bm.bmWidth, r.right - r.left - S(4)), h = bm.bmHeight;
     int x = (r.left + r.right - w) / 2, y = (r.top + r.bottom - h) / 2;
-    // White icon background is drawn with "darken" so tile shading shows through.
-    BitBlt(hdc, x, y, w, h, mem, (bm.bmWidth - w) / 2, 0, SRCAND);
+    // The icon was rendered on the pane colour; that colour is left out so the tile shows through.
+    TransparentBlt(hdc, x, y, w, h, mem, (bm.bmWidth - w) / 2, 0, w, h, g_c.surface);
     DeleteDC(mem);
 }
 
 static void PaneButton(HDC hdc, const RECT& r, bool on, bool hot) {
-    COLORREF fill = on ? RGB(0xD6, 0xE4, 0xFB) : hot ? RGB(0xEE, 0xF0, 0xF3) : RGB(0xFF, 0xFF, 0xFF);
-    HBRUSH b = CreateSolidBrush(fill);
-    HPEN pen = CreatePen(PS_SOLID, 1, on ? RGB(0x1F, 0x6F, 0xEB) : RGB(0xD5, 0xD9, 0xDF));
-    HGDIOBJ ob = SelectObject(hdc, b), op = SelectObject(hdc, pen);
-    RoundRect(hdc, r.left, r.top, r.right, r.bottom, S(6), S(6));
-    SelectObject(hdc, ob);
-    SelectObject(hdc, op);
-    DeleteObject(b);
-    DeleteObject(pen);
+    if (on) RoundRectAA(hdc, r, (float)S(8), g_c.accentSoft, g_c.accent, 1.5f);
+    else if (hot) RoundRectAA(hdc, r, (float)S(8), g_c.hover, g_c.border);
+    else RoundRectAA(hdc, r, (float)S(8), g_c.surface, g_c.border);
 }
 
 static int g_paneScroll = 0, g_paneContentH = 0;
 static void PaintMarksPane(HDC hdc, const RECT& rc) {
-    HBRUSH bg = CreateSolidBrush(RGB(0xF3, 0xF4, 0xF6));
-    FillRect(hdc, &rc, bg);
-    DeleteObject(bg);
-    RECT div = {0, 0, 1, rc.bottom};
-    HBRUSH dv = CreateSolidBrush(RGB(0xD0, 0xD4, 0xDA));
-    FillRect(hdc, &div, dv);
-    DeleteObject(dv);
+    FillSolid(hdc, rc, g_c.surface);
+    FillSolid(hdc, RECT{0, 0, 1, rc.bottom}, g_c.border);
     g_paneHits.clear();
     SetBkMode(hdc, TRANSPARENT);
     int x0 = S(10), width = rc.right - S(20), y = S(8) - g_paneScroll;
     auto heading = [&](const wchar_t* text) {
-        SelectObject(hdc, g_font);
-        SetTextColor(hdc, RGB(0x55, 0x5B, 0x66));
-        RECT r = {x0, y, x0 + width, y + S(20)};
-        DrawTextW(hdc, text, -1, &r, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        y += S(22);
+        // Small capitals in the muted colour, like a section label.
+        std::wstring up = text;
+        for (auto& ch : up) ch = (wchar_t)towupper(ch);
+        SelectObject(hdc, g_headFont);
+        SetTextColor(hdc, g_c.muted);
+        RECT r = {x0 + S(2), y + S(4), x0 + width, y + S(24)};
+        DrawTextW(hdc, up.c_str(), -1, &r, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        y += S(28);
     };
     auto label = [&](const RECT& r, const wchar_t* text, COLORREF col) {
-        SelectObject(hdc, g_font);
+        SelectObject(hdc, g_smallFont);
         SetTextColor(hdc, col);
         RECT rr = r;
         DrawTextW(hdc, text, -1, &rr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
@@ -1825,7 +2147,7 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
             r.bottom = r.top + bh;
             bool hot = hit(r, 1, order[k], nullptr);
             PaneButton(hdc, r, g_ms.tool == order[k], hot);
-            label(r, kToolNames[order[k]], RGB(0x24, 0x29, 0x33));
+            label(r, kToolNames[order[k]], g_c.text);
         }
         y += 3 * (bh + gap) + S(8);
     }
@@ -1859,17 +2181,17 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
         DrawBitmapCentered(hdc, icon, tile);
         if (icon) DeleteObject(icon);
         RECT lr = {tile.right + S(6), y, tile.right + S(80), y + bh};
-        SelectObject(hdc, g_font);
-        SetTextColor(hdc, RGB(0x44, 0x48, 0x50));
+        SelectObject(hdc, g_smallFont);
+        SetTextColor(hdc, g_c.text2);
         DrawTextW(hdc, isNum ? L"Next number" : L"Next letter", -1, &lr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         RECT minus = {x0 + width - S(58), y + S(4), x0 + width - S(32), y + bh - S(4)};
         RECT plus = {x0 + width - S(26), y + S(4), x0 + width, y + bh - S(4)};
         bool hm = hit(minus, isNum ? 8 : 10, 0, L"Previous");
         PaneButton(hdc, minus, false, hm);
-        label(minus, L"\x2212", RGB(0x24, 0x29, 0x33));
+        label(minus, L"\x2212", g_c.text);
         bool hp = hit(plus, isNum ? 9 : 11, 0, L"Next");
         PaneButton(hdc, plus, false, hp);
-        label(plus, L"+", RGB(0x24, 0x29, 0x33));
+        label(plus, L"+", g_c.text);
         y += bh + S(4);
     }
     // Auto-increment and wrap check boxes.
@@ -1878,15 +2200,17 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
         hit(r, k == 0 ? 7 : 12, 0, nullptr);
         RECT box = {x0 + S(2), y + S(5), x0 + S(16), y + S(19)};
         bool on = k == 0 ? g_ms.autoInc : g_ms.wrap;
-        PaneButton(hdc, box, on, false);
         if (on) {
-            SelectObject(hdc, g_iconFont);
-            SetTextColor(hdc, RGB(0x1F, 0x6F, 0xEB));
-            DrawTextW(hdc, L"\xE73E", -1, &box, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            RoundRectAA(hdc, box, (float)S(4), g_c.accent);
+            SelectObject(hdc, g_smallFont);
+            SetTextColor(hdc, g_c.onAccent);
+            DrawTextW(hdc, L"\x2713", -1, &box, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        } else {
+            RoundRectAA(hdc, box, (float)S(4), g_c.surface, g_c.muted, 1.2f);
         }
         RECT tr = {box.right + S(8), y, x0 + width, y + S(24)};
-        SelectObject(hdc, g_font);
-        SetTextColor(hdc, RGB(0x24, 0x29, 0x33));
+        SelectObject(hdc, g_smallFont);
+        SetTextColor(hdc, g_c.text);
         DrawTextW(hdc, k == 0 ? L"Auto-increment" : L"Start over after 40 / Z", -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         y += S(24);
     }
@@ -1900,16 +2224,14 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
             hit(r, 5, i, marks::ColorName(i));
             uint8_t cr, cg, cb;
             marks::ColorRgb(i, cr, cg, cb);
+            int d = std::min<int>(r.right - r.left, r.bottom - r.top + S(4)), cxm = (r.left + r.right) / 2, cym = (r.top + r.bottom) / 2;
+            RECT c = {cxm - d / 2, cym - d / 2, cxm + d / 2, cym + d / 2};
             if (g_ms.color == i) {
-                RECT o = r;
-                InflateRect(&o, S(2), S(2));
-                HBRUSH ob = CreateSolidBrush(RGB(0x24, 0x29, 0x33));
-                FillRect(hdc, &o, ob);
-                DeleteObject(ob);
+                RECT o = c;
+                InflateRect(&o, S(3), S(3));
+                EllipseAA(hdc, o, CLR_INVALID, g_c.text, 2.0f);
             }
-            HBRUSH b = CreateSolidBrush(RGB(cr, cg, cb));
-            FillRect(hdc, &r, b);
-            DeleteObject(b);
+            EllipseAA(hdc, c, RGB(cr, cg, cb));
         }
         y += S(34);
     }
@@ -1920,7 +2242,7 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
             RECT r = {x0 + i * (bw + gap), y, x0 + i * (bw + gap) + bw, y + S(26)};
             bool hot = hit(r, 6, i, nullptr);
             PaneButton(hdc, r, g_ms.size == i, hot);
-            label(r, marks::SizeName(i), RGB(0x24, 0x29, 0x33));
+            label(r, marks::SizeName(i), g_c.text);
         }
         y += S(36);
     }
@@ -1933,29 +2255,29 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
             RECT r = {x0 + i * (bw + gap), y, x0 + i * (bw + gap) + bw, y + bh};
             bool hot = hit(r, 13, i, nullptr);
             PaneButton(hdc, r, g_ms.textFamily == i, hot);
-            label(r, fam[i], RGB(0x24, 0x29, 0x33));
+            label(r, fam[i], g_c.text);
         }
         RECT br = {x0 + width - S(30), y, x0 + width, y + bh};
         bool hb = hit(br, 14, 0, L"Bold");
         PaneButton(hdc, br, g_ms.textBold != 0, hb);
         SelectObject(hdc, g_bigFont ? g_bigFont : g_font);
-        SetTextColor(hdc, RGB(0x24, 0x29, 0x33));
+        SetTextColor(hdc, g_c.text);
         DrawTextW(hdc, L"B", -1, &br, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         y += bh + S(6);
         RECT lr = {x0, y, x0 + width - S(60), y + bh};
         wchar_t sz[32];
         swprintf(sz, 32, L"Size %d pt", g_ms.textSize);
-        SelectObject(hdc, g_font);
-        SetTextColor(hdc, RGB(0x44, 0x48, 0x50));
+        SelectObject(hdc, g_smallFont);
+        SetTextColor(hdc, g_c.text2);
         DrawTextW(hdc, sz, -1, &lr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         RECT minus = {x0 + width - S(58), y + S(2), x0 + width - S(32), y + bh - S(2)};
         RECT plus = {x0 + width - S(26), y + S(2), x0 + width, y + bh - S(2)};
         bool hm = hit(minus, 15, 0, L"Smaller");
         PaneButton(hdc, minus, false, hm);
-        label(minus, L"\x2212", RGB(0x24, 0x29, 0x33));
+        label(minus, L"\x2212", g_c.text);
         bool hp = hit(plus, 16, 0, L"Larger");
         PaneButton(hdc, plus, false, hp);
-        label(plus, L"+", RGB(0x24, 0x29, 0x33));
+        label(plus, L"+", g_c.text);
         y += bh + S(10);
     }
     heading(L"Edit text picks");
@@ -1966,15 +2288,15 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
             RECT r = {x0 + i * (bw + gap), y, x0 + i * (bw + gap) + bw, y + bh};
             bool hot = hit(r, 17, i, i ? L"Retype a whole paragraph; the lines re-wrap" : L"Retype one line or table cell");
             PaneButton(hdc, r, g_ms.editPara == i, hot);
-            label(r, modes[i], RGB(0x24, 0x29, 0x33));
+            label(r, modes[i], g_c.text);
         }
         y += bh + S(10);
     }
     // Shortcut reminder.
     RECT hr = {x0, y, x0 + width, y + S(110)};
     g_paneContentH = y + S(116) + g_paneScroll;
-    SelectObject(hdc, g_font);
-    SetTextColor(hdc, RGB(0x6B, 0x72, 0x80));
+    SelectObject(hdc, g_smallFont);
+    SetTextColor(hdc, g_c.muted);
     DrawTextW(hdc,
               L"Click a mark, then click the page. Drag to size it.\n\n"
               L"Keys on the page: K tickmark, N number, L letter, H highlight, T add text, E edit text, S select, Esc hand. "
@@ -2069,38 +2391,124 @@ static LRESULT CALLBACK MarksProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
+// ---- start screen (no file open): open button and recent files
+
+struct StartHit { RECT r; int action; int arg; };  // action 1 = open, 2 = recent file
+static std::vector<StartHit> g_startHits;
+static int g_startHot = -1;
+
+static void PaintStart(HDC hdc, const RECT& rc) {
+    g_startHits.clear();
+    SetBkMode(hdc, TRANSPARENT);
+    std::vector<int> rec;
+    for (int i = 0; i < (int)g_recent.size() && rec.size() < 6; i++)
+        if (GetFileAttributesW(g_recent[i].c_str()) != INVALID_FILE_ATTRIBUTES) rec.push_back(i);
+    int cw = std::min<int>(rc.right - S(48), S(560)), cx = (rc.right - cw) / 2;
+    int rowH = S(54);
+    int listH = rec.empty() ? 0 : S(40) + (int)rec.size() * rowH + S(8);
+    int totalH = S(64) + S(22) + S(44) + S(30) + S(26) + S(48) + S(30) + listH;
+    int y = std::max<int>(S(28), (rc.bottom - totalH) / 2);
+    int mid = rc.right / 2;
+    // Logo: a rounded tile with a tick.
+    RECT logo = {mid - S(32), y, mid + S(32), y + S(64)};
+    RoundRectAA(hdc, logo, (float)S(16), g_c.accent);
+    SelectObject(hdc, g_logoFont);
+    SetTextColor(hdc, g_c.onAccent);
+    DrawTextW(hdc, L"\xE73E", -1, &logo, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    y += S(64) + S(22);
+    RECT tr = {0, y, rc.right, y + S(44)};
+    SelectObject(hdc, g_titleFont);
+    SetTextColor(hdc, g_c.text);
+    DrawTextW(hdc, APP_NAME, -1, &tr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    y += S(44);
+    RECT sr = {0, y, rc.right, y + S(30)};
+    SelectObject(hdc, g_font);
+    SetTextColor(hdc, g_c.text2);
+    DrawTextW(hdc, L"Open a workpaper, or drop PDFs, Word files and images anywhere in this window.", -1, &sr,
+              DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    y += S(30) + S(26);
+    RECT btn = {mid - S(96), y, mid + S(96), y + S(48)};
+    bool hotBtn = g_startHot == 0;
+    RoundRectAA(hdc, btn, (float)S(12), hotBtn ? g_c.accentHover : g_c.accent);
+    g_startHits.push_back({btn, 1, 0});
+    RECT bi = {btn.left + S(22), btn.top, btn.left + S(46), btn.bottom};
+    SelectObject(hdc, g_iconFont);
+    SetTextColor(hdc, g_c.onAccent);
+    DrawTextW(hdc, L"\xE8E5", -1, &bi, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    RECT bt = {btn.left + S(50), btn.top, btn.right - S(16), btn.bottom};
+    SelectObject(hdc, g_btnFont);
+    DrawTextW(hdc, L"Open a PDF", -1, &bt, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    y += S(48);
+    RECT hint = {0, y + S(6), rc.right, y + S(28)};
+    SelectObject(hdc, g_smallFont);
+    SetTextColor(hdc, g_c.muted);
+    DrawTextW(hdc, L"Ctrl+O", -1, &hint, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    y += S(30);
+    if (rec.empty()) return;
+    y += S(14);
+    RECT hd = {cx + S(4), y, cx + cw, y + S(26)};
+    SelectObject(hdc, g_headFont);
+    SetTextColor(hdc, g_c.muted);
+    DrawTextW(hdc, L"RECENT", -1, &hd, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    y += S(30);
+    RECT card = {cx, y, cx + cw, y + (int)rec.size() * rowH + S(8)};
+    SoftShadow(hdc, card, S(4), g_c.shadow, g_dark ? 60 : 18);
+    RoundRectAA(hdc, card, (float)S(12), g_c.surface, g_c.border);
+    int ry = y + S(4);
+    for (size_t k = 0; k < rec.size(); k++) {
+        const std::wstring& path = g_recent[rec[k]];
+        RECT row = {cx + S(4), ry, cx + cw - S(4), ry + rowH};
+        int hitIndex = (int)g_startHits.size();
+        g_startHits.push_back({row, 2, rec[k]});
+        if (g_startHot == hitIndex) RoundRectAA(hdc, row, (float)S(9), g_c.hover);
+        RECT ic = {row.left + S(10), row.top + S(9), row.left + S(46), row.bottom - S(9)};
+        RoundRectAA(hdc, ic, (float)S(8), g_c.accentSoft);
+        SelectObject(hdc, g_iconFont);
+        SetTextColor(hdc, g_c.accent);
+        DrawTextW(hdc, L"\xE8A5", -1, &ic, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        size_t sl = path.find_last_of(L"\\/");
+        std::wstring name = sl == std::wstring::npos ? path : path.substr(sl + 1);
+        std::wstring folder = sl == std::wstring::npos ? L"" : path.substr(0, sl);
+        RECT nr = {ic.right + S(14), row.top + S(8), row.right - S(12), row.top + S(29)};
+        SelectObject(hdc, g_font);
+        SetTextColor(hdc, g_c.text);
+        DrawTextW(hdc, name.c_str(), -1, &nr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        RECT fr = {nr.left, row.top + S(28), nr.right, row.bottom - S(6)};
+        SelectObject(hdc, g_smallFont);
+        SetTextColor(hdc, g_c.muted);
+        DrawTextW(hdc, folder.c_str(), -1, &fr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_PATH_ELLIPSIS | DT_NOPREFIX);
+        ry += rowH;
+    }
+}
+
+static int StartHitAt(POINT p) {
+    for (int i = 0; i < (int)g_startHits.size(); i++) if (PtInRect(&g_startHits[i].r, p)) return i;
+    return -1;
+}
+
+static void StartClick(POINT p) {
+    int i = StartHitAt(p);
+    if (i < 0) return;
+    if (g_startHits[i].action == 1) SendMessageW(g_main, WM_COMMAND, ID_OPEN, 0);
+    else if (g_startHits[i].action == 2 && g_startHits[i].arg < (int)g_recent.size()) OpenFile(g_recent[g_startHits[i].arg]);
+}
+
 static void PaintView(HDC hdc, const RECT& rc) {
     Tab* t = Cur();
-    HBRUSH bg = CreateSolidBrush(RGB(0xDD, 0xE0, 0xE4));
-    FillRect(hdc, &rc, bg);
-    DeleteObject(bg);
+    FillSolid(hdc, rc, g_c.canvas);
     if (!t) {
-        SelectObject(hdc, g_bigFont);
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(0x55, 0x5B, 0x66));
-        RECT r = rc;
-        r.bottom = rc.bottom / 2;
-        r.top = r.bottom - S(40);
-        DrawTextW(hdc, L"Drop PDF files here", -1, &r, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-        SelectObject(hdc, g_font);
-        r.top = r.bottom;
-        r.bottom = r.top + S(30);
-        DrawTextW(hdc, L"or press Ctrl+O to open a file", -1, &r, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        PaintStart(hdc, rc);
         return;
     }
     int first, last;
     VisibleRange(t, first, last);
     HDC mem = CreateCompatibleDC(hdc);
     HBRUSH white = (HBRUSH)GetStockObject(WHITE_BRUSH);
-    HBRUSH shadow = CreateSolidBrush(RGB(0xC4, 0xC8, 0xCE));
     bool missing = false;
     for (int i = first; i <= last; i++) {
         int x = PageX(t, i), y = t->top[i] - t->sy;
         RECT pr = {x, y, x + t->pw[i], y + t->ph[i]};
-        RECT sh = pr;
-        OffsetRect(&sh, 1, 2);
-        InflateRect(&sh, 1, 1);
-        FillRect(hdc, &sh, shadow);
+        SoftShadow(hdc, pr, S(5), g_c.shadow, g_dark ? 110 : 34);
         Cached& c = t->cache[i];
         RECT need = NeededRegion(t, i);
         if (!Covers(c, t->scale, need)) missing = true;
@@ -2120,7 +2528,6 @@ static void PaintView(HDC hdc, const RECT& rc) {
             FillRect(hdc, &pr, white);
         }
     }
-    DeleteObject(shadow);
     DeleteDC(mem);
     PaintOverlay(hdc, t);
     if (missing) RequestRender();
@@ -2241,6 +2648,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK:
         SetFocus(h);
+        if (!t) { StartClick(POINT{GET_X_LPARAM(l), GET_Y_LPARAM(l)}); return 0; }
         if (t) {
             POINT v = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
             // Hand tool, or the space bar held down: pan.
@@ -2260,6 +2668,18 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (g_dragging && t) ScrollTo(t, g_dragSX - (GET_X_LPARAM(l) - g_dragStart.x), g_dragSY - (GET_Y_LPARAM(l) - g_dragStart.y));
         else if (t && g_g.active) ToolMove(t, POINT{GET_X_LPARAM(l), GET_Y_LPARAM(l)});
         else if (t && g_ms.tool == kEditText) UpdateEditHover(t, POINT{GET_X_LPARAM(l), GET_Y_LPARAM(l)});
+        else if (!t) {
+            int hot = StartHitAt(POINT{GET_X_LPARAM(l), GET_Y_LPARAM(l)});
+            if (hot != g_startHot) {
+                g_startHot = hot;
+                InvalidateRect(h, nullptr, FALSE);
+                TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, h, 0};
+                TrackMouseEvent(&tme);
+            }
+        }
+        return 0;
+    case WM_MOUSELEAVE:
+        if (g_startHot >= 0) { g_startHot = -1; InvalidateRect(h, nullptr, FALSE); }
         return 0;
     case WM_LBUTTONUP:
         if (g_dragging) g_dragging = false;
@@ -2280,6 +2700,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (g_textEdit && (HWND)l == g_textEdit && HIWORD(w) == EN_CHANGE) FitTextEditor();
         return 0;
     case WM_SETCURSOR:
+        if (LOWORD(l) == HTCLIENT && !t && g_startHot >= 0) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
         if (LOWORD(l) == HTCLIENT && t) {
             POINT v;
             GetCursorPos(&v);
@@ -2388,22 +2809,15 @@ static LRESULT CALLBACK ThumbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         HDC buf = CreateCompatibleDC(hdc);
         HBITMAP bb = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
         HGDIOBJ oldb = SelectObject(buf, bb);
-        HBRUSH bg = CreateSolidBrush(RGB(0xF3, 0xF4, 0xF6));
-        FillRect(buf, &rc, bg);
-        DeleteObject(bg);
-        RECT div = {rc.right - 1, 0, rc.right, rc.bottom};
-        HBRUSH dv = CreateSolidBrush(RGB(0xD0, 0xD4, 0xDA));
-        FillRect(buf, &div, dv);
-        DeleteObject(dv);
+        FillSolid(buf, rc, g_c.surface);
+        FillSolid(buf, RECT{rc.right - 1, 0, rc.right, rc.bottom}, g_c.border);
         if (t && !t->thumbTop.empty()) {
             int curPage = CurrentPage(t);
             HDC mem = CreateCompatibleDC(hdc);
             SelectObject(buf, g_font);
             SetBkMode(buf, TRANSPARENT);
-            HBRUSH blue = CreateSolidBrush(RGB(0x1F, 0x6F, 0xEB));
-            HBRUSH selBg = CreateSolidBrush(RGB(0xD6, 0xE4, 0xFB));
+            HBRUSH blue = CreateSolidBrush(g_c.accent);
             HBRUSH white = (HBRUSH)GetStockObject(WHITE_BRUSH);
-            HBRUSH edge = CreateSolidBrush(RGB(0xC4, 0xC8, 0xCE));
             bool missing = false;
             for (int i = 0; i < t->pdf.PageCount(); i++) {
                 int y = t->thumbTop[i] - t->thumbScroll;
@@ -2411,13 +2825,17 @@ static LRESULT CALLBACK ThumbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 if (y > rc.bottom) break;
                 int x = (rc.right - t->thumbW) / 2;
                 if (t->sel.count(i)) {
-                    RECT sb = {S(6), y - S(6), rc.right - S(7), y + t->thumbH[i] + S(24)};
-                    FillRect(buf, &sb, selBg);
+                    RECT sb = {S(8), y - S(8), rc.right - S(9), y + t->thumbH[i] + S(28)};
+                    RoundRectAA(buf, sb, (float)S(10), g_c.accentSoft);
                 }
                 RECT pr = {x, y, x + t->thumbW, y + t->thumbH[i]};
-                RECT fr = pr;
-                InflateRect(&fr, i == curPage ? S(2) : 1, i == curPage ? S(2) : 1);
-                FillRect(buf, &fr, i == curPage ? blue : edge);
+                if (i == curPage) {
+                    RECT fr = pr;
+                    InflateRect(&fr, S(3), S(3));
+                    RoundRectAA(buf, fr, (float)S(5), CLR_INVALID, g_c.accent, (float)S(2));
+                } else {
+                    SoftShadow(buf, pr, S(3), g_c.shadow, g_dark ? 90 : 26);
+                }
                 FillRect(buf, &pr, white);
                 if (t->thumb[i]) {
                     SelectObject(mem, t->thumb[i]);
@@ -2425,8 +2843,15 @@ static LRESULT CALLBACK ThumbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 } else missing = true;
                 wchar_t num[16];
                 swprintf(num, 16, L"%d", i + 1);
-                RECT lr = {0, pr.bottom + S(4), rc.right, pr.bottom + S(22)};
-                SetTextColor(buf, i == curPage ? RGB(0x1F, 0x6F, 0xEB) : RGB(0x44, 0x48, 0x50));
+                RECT lr = {0, pr.bottom + S(6), rc.right, pr.bottom + S(24)};
+                SelectObject(buf, g_smallFont);
+                if (i == curPage) {
+                    RECT pill = {rc.right / 2 - S(16), lr.top, rc.right / 2 + S(16), lr.bottom};
+                    RoundRectAA(buf, pill, (float)S(9), g_c.accent);
+                    SetTextColor(buf, g_c.onAccent);
+                } else {
+                    SetTextColor(buf, g_c.muted);
+                }
                 DrawTextW(buf, num, -1, &lr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             }
             // Insertion marker while dragging pages or files.
@@ -2438,8 +2863,6 @@ static LRESULT CALLBACK ThumbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 FillRect(buf, &bar, blue);
             }
             DeleteObject(blue);
-            DeleteObject(selBg);
-            DeleteObject(edge);
             DeleteDC(mem);
             if (missing) RequestRender();
         }
@@ -2800,6 +3223,7 @@ static void PaintMatches(HDC hdc, Tab* t) {
 
 static WNDPROC g_findProc;
 static LRESULT CALLBACK FindEditProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_SETFOCUS || m == WM_KILLFOCUS) InvalidateRect(g_tool, nullptr, FALSE);
     if (m == WM_KEYDOWN && w == VK_RETURN) { DoFind(GetKeyState(VK_SHIFT) < 0); return 0; }
     if (m == WM_KEYDOWN && w == VK_ESCAPE) { ClearFind(); SetFocus(g_view); return 0; }
     if (m == WM_CHAR && (w == VK_RETURN || w == VK_ESCAPE)) return 0;
@@ -2917,22 +3341,23 @@ static LRESULT CALLBACK SideProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         HDC hdc = BeginPaint(h, &ps);
         RECT rc;
         GetClientRect(h, &rc);
-        HBRUSH bg = CreateSolidBrush(RGB(0xF3, 0xF4, 0xF6));
-        FillRect(hdc, &rc, bg);
-        DeleteObject(bg);
+        FillSolid(hdc, rc, g_c.surface);
+        FillSolid(hdc, RECT{rc.right - 1, 0, rc.right, rc.bottom}, g_c.border);
         SetBkMode(hdc, TRANSPARENT);
-        SelectObject(hdc, g_font);
-        int wEach = rc.right / 3;
+        SelectObject(hdc, g_smallFont);
+        // A segmented control: a soft track with the chosen segment raised.
+        RECT track = {S(10), S(8), rc.right - S(11), rc.bottom - S(4)};
+        RoundRectAA(hdc, track, (float)S(9), g_c.input);
+        int wEach = (track.right - track.left) / 3;
         for (int i = 0; i < 3; i++) {
-            RECT r = {i * wEach, 0, i == 2 ? rc.right : (i + 1) * wEach, rc.bottom};
-            SetTextColor(hdc, g_sideMode == i ? RGB(0x1F, 0x6F, 0xEB) : RGB(0x44, 0x48, 0x50));
-            DrawTextW(hdc, kSideNames[i], -1, &r, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            RECT r = {track.left + i * wEach, track.top, i == 2 ? track.right : track.left + (i + 1) * wEach, track.bottom};
             if (g_sideMode == i) {
-                RECT u = {r.left + S(6), rc.bottom - S(3), r.right - S(6), rc.bottom};
-                HBRUSH b = CreateSolidBrush(RGB(0x1F, 0x6F, 0xEB));
-                FillRect(hdc, &u, b);
-                DeleteObject(b);
+                RECT seg = r;
+                InflateRect(&seg, -S(3), -S(3));
+                RoundRectAA(hdc, seg, (float)S(7), g_c.surface, g_c.border);
             }
+            SetTextColor(hdc, g_sideMode == i ? g_c.text : g_c.text2);
+            DrawTextW(hdc, kSideNames[i], -1, &r, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         }
         EndPaint(h, &ps);
         return 0;
@@ -2940,7 +3365,7 @@ static LRESULT CALLBACK SideProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_LBUTTONDOWN: {
         RECT rc;
         GetClientRect(h, &rc);
-        int i = std::clamp(GET_X_LPARAM(l) / std::max(1, (int)rc.right / 3), 0, 2);
+        int i = std::clamp((GET_X_LPARAM(l) - S(10)) / std::max(1, ((int)rc.right - S(21)) / 3), 0, 2);
         SetSideMode(i);
         return 0;
     }
@@ -3141,72 +3566,136 @@ static void OfferRecovery() {
 // ---------------------------------------------------------------- toolbar
 
 struct ToolButton {
-    int id;
-    const wchar_t* glyph;  // Segoe MDL2 Assets / Segoe Fluent Icons
-    const wchar_t* label;
+    int id;              // command; 0 = page box, -1 = divider, -2 = zoom readout, -3 = search box
+    const wchar_t* glyph;  // Segoe Fluent Icons / Segoe MDL2 Assets
     const wchar_t* tip;
+    int align;           // 0 left, 1 centre, 2 right
     RECT rc;
-    bool showLabel = true;
+    float hover;         // 0..1, animated
 };
 static ToolButton g_buttons[] = {
-    {ID_OPEN, L"\xE8E5", L"Open", L"Open (Ctrl+O)", {}},
-    {ID_SAVE, L"\xE74E", L"Save", L"Save (Ctrl+S)", {}},
-    {ID_UNDO, L"\xE7A7", nullptr, L"Undo (Ctrl+Z)", {}},
-    {ID_THUMBS, L"\xE8A9", L"Pages", L"Show or hide page thumbnails (F4)", {}},
-    {ID_MARKSPANE, L"\xE73E", L"Marks", L"Show or hide the tickmarks and tools pane (F6)", {}},
-    {ID_PREVPAGE, L"\xE70E", nullptr, L"Previous page (Left arrow)", {}},
-    {ID_NEXTPAGE, L"\xE70D", nullptr, L"Next page (Right arrow)", {}},
-    {0, nullptr, nullptr, nullptr, {}},  // page box sits here
-    {ID_ZOOMOUT, L"\xE71F", nullptr, L"Zoom out (Ctrl+minus)", {}},
-    {ID_ZOOMIN, L"\xE8A3", nullptr, L"Zoom in (Ctrl+plus)", {}},
-    {ID_FITWIDTH, L"\xE9A6", L"Fit width", L"Fit width (Ctrl+1)", {}},
-    {ID_FITPAGE, L"\xE740", L"Fit page", L"Fit page (Ctrl+2)", {}},
-    {ID_ROTR, L"\xE7AD", L"Rotate", L"Rotate selected pages right (Ctrl+R)", {}},
-    {ID_INSERTFILE, L"\xE710", L"Insert", L"Insert pages from files", {}},
-    {ID_DEL, L"\xE74D", L"Delete", L"Delete selected pages (Del)", {}},
+    {ID_MENU, L"\xE700", L"Menu (Alt)", 0, {}, 0},
+    {-1, nullptr, nullptr, 0, {}, 0},
+    {ID_OPEN, L"\xE8E5", L"Open (Ctrl+O)", 0, {}, 0},
+    {ID_SAVE, L"\xE74E", L"Save (Ctrl+S)", 0, {}, 0},
+    {ID_PRINT, L"\xE749", L"Print (Ctrl+P)", 0, {}, 0},
+    {-1, nullptr, nullptr, 0, {}, 0},
+    {ID_UNDO, L"\xE7A7", L"Undo (Ctrl+Z)", 0, {}, 0},
+    {ID_REDO, L"\xE7A6", L"Redo (Ctrl+Y)", 0, {}, 0},
+    {ID_PREVPAGE, L"\xE76B", L"Previous page", 1, {}, 0},
+    {0, nullptr, L"Page number: type one and press Enter (Ctrl+G)", 1, {}, 0},
+    {ID_NEXTPAGE, L"\xE76C", L"Next page", 1, {}, 0},
+    {-1, nullptr, nullptr, 1, {}, 0},
+    {ID_ZOOMOUT, L"\xE71F", L"Zoom out (Ctrl+minus)", 1, {}, 0},
+    {-2, nullptr, L"Zoom: fit width, fit page or a set size", 1, {}, 0},
+    {ID_ZOOMIN, L"\xE8A3", L"Zoom in (Ctrl+plus)", 1, {}, 0},
+    {ID_ROTR, L"\xE7AD", L"Rotate selected pages (Ctrl+R)", 2, {}, 0},
+    {ID_INSERTFILE, L"\xE8F4", L"Insert pages from files", 2, {}, 0},
+    {ID_DEL, L"\xE74D", L"Delete selected pages (Del)", 2, {}, 0},
+    {-1, nullptr, nullptr, 2, {}, 0},
+    {-3, nullptr, nullptr, 2, {}, 0},
+    {-1, nullptr, nullptr, 2, {}, 0},
+    {ID_THUMBS, L"\xE8A9", L"Side pane: pages, bookmarks, comments (F4)", 2, {}, 0},
+    {ID_MARKSPANE, L"\xE70F", L"Marks and tools pane (F6)", 2, {}, 0},
 };
-static int g_hot = -1;
+static const int kButtonCount = (int)(sizeof(g_buttons) / sizeof(g_buttons[0]));
+static int g_hot = -1, g_pressedBtn = -1;
 static RECT g_pageBoxRect, g_findRect;
+static HWND g_tip;
+static const UINT_PTR kHoverTimer = 1;
+
+static int ButtonWidth(const ToolButton& b, int searchW) {
+    if (b.id == -1) return S(17);
+    if (b.id == 0) return S(100);
+    if (b.id == -2) return S(62);
+    if (b.id == -3) return searchW;
+    return S(38);
+}
 
 static void LayoutToolbar() {
-    HDC hdc = GetDC(g_tool);
     RECT rc;
     GetClientRect(g_tool, &rc);
-    int h = rc.bottom, x = 0;
-    // Drop the labels of the view and page buttons when the window is too narrow for them and the search box.
-    for (int pass = 0; pass < 2; pass++) {
-        x = S(8);
-        for (auto& b : g_buttons) {
-            if (b.id == 0) {
-                int w = S(110);
-                g_pageBoxRect = {x, 0, x + w, h};
-                MoveWindow(g_pageEdit, x + S(4), (h - S(22)) / 2, S(44), S(22), TRUE);
-                x += w;
-                continue;
-            }
-            bool core = b.id == ID_OPEN || b.id == ID_SAVE || b.id == ID_THUMBS || b.id == ID_MARKSPANE;
-            b.showLabel = b.label && (pass == 0 || core);
-            int w = S(32);
-            if (b.showLabel) {
-                SelectObject(hdc, g_font);
-                SIZE sz;
-                GetTextExtentPoint32W(hdc, b.label, (int)wcslen(b.label), &sz);
-                w = S(36) + sz.cx;
-            }
-            b.rc = {x, S(4), x + w, h - S(4)};
-            x += w + S(2);
+    int h = rc.bottom, gap = S(2);
+    auto groupW = [&](int align, int searchW) {
+        int w = 0;
+        for (auto& b : g_buttons) if (b.align == align) w += ButtonWidth(b, searchW) + gap;
+        return w;
+    };
+    int searchW = S(260);
+    int lw = groupW(0, 0), cw = groupW(1, 0);
+    // The search box gives way first when the window is narrow.
+    while (searchW > S(130) && lw + cw + groupW(2, searchW) + S(60) > rc.right) searchW -= S(10);
+    int rw = groupW(2, searchW);
+    int leftEnd = S(10) + lw, rightStart = rc.right - S(10) - rw;
+    int cx = std::max(leftEnd + S(16), std::min<int>((rc.right - cw) / 2, rightStart - S(16) - cw));
+    int xl = S(10), xc = cx, xr = rightStart;
+    int top = (h - S(38)) / 2;
+    for (auto& b : g_buttons) {
+        int& x = b.align == 0 ? xl : b.align == 1 ? xc : xr;
+        int w = ButtonWidth(b, searchW);
+        b.rc = {x, top, x + w, top + S(38)};
+        if (b.id == 0) {
+            g_pageBoxRect = b.rc;
+            InflateRect(&g_pageBoxRect, 0, -S(3));
+            MoveWindow(g_pageEdit, b.rc.left + S(10), h / 2 - S(10), S(38), S(20), TRUE);
         }
-        if (x + S(200) <= rc.right) break;
+        if (b.id == -3) {
+            g_findRect = b.rc;
+            InflateRect(&g_findRect, 0, -S(2));
+            if (g_findEdit) MoveWindow(g_findEdit, b.rc.left + S(36), h / 2 - S(10), w - S(46), S(20), TRUE);
+        }
+        x += w + gap;
     }
-    int fw = std::clamp((int)rc.right - x - S(16), S(90), S(240));
-    int fx = std::max<int>(x + S(8), rc.right - fw - S(10));
-    g_findRect = {fx, 0, fx + fw, h};
-    if (g_findEdit) MoveWindow(g_findEdit, fx + S(26), (h - S(24)) / 2, fw - S(26), S(24), TRUE);
-    ReleaseDC(g_tool, hdc);
+    // Tooltips follow the buttons.
+    if (g_tip) {
+        for (int i = 0; i < kButtonCount; i++) {
+            TOOLINFOW ti = {sizeof(ti)};
+            ti.hwnd = g_tool;
+            ti.uId = i + 1;
+            SendMessageW(g_tip, TTM_DELTOOLW, 0, (LPARAM)&ti);
+            if (!g_buttons[i].tip) continue;
+            ti.uFlags = TTF_SUBCLASS;
+            ti.rect = g_buttons[i].rc;
+            ti.lpszText = (LPWSTR)g_buttons[i].tip;
+            SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        }
+    }
+}
+
+static void ShowAppMenu() {
+    RECT r = g_buttons[0].rc;
+    POINT p = {r.left, r.bottom + S(4)};
+    ClientToScreen(g_tool, &p);
+    TrackPopupMenuEx(g_menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON, p.x, p.y, g_main, nullptr);
+}
+
+static const int kZoomPresets[] = {50, 75, 100, 125, 150, 200, 300, 400};
+
+static void ShowZoomMenu(const RECT& r) {
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, ID_FITWIDTH, L"Fit width\tCtrl+1");
+    AppendMenuW(m, MF_STRING, ID_FITPAGE, L"Fit page\tCtrl+2");
+    AppendMenuW(m, MF_STRING, ID_ZOOM100, L"Actual size\tCtrl+0");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    for (int k = 0; k < (int)(sizeof(kZoomPresets) / sizeof(kZoomPresets[0])); k++)
+        AppendMenuW(m, MF_STRING, ID_ZOOMPRESET + k, (std::to_wstring(kZoomPresets[k]) + L"%").c_str());
+    POINT p = {r.left, r.bottom + S(4)};
+    ClientToScreen(g_tool, &p);
+    TrackPopupMenuEx(m, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON, p.x, p.y, g_main, nullptr);
+    DestroyMenu(m);
+}
+
+static bool ButtonEnabled(const ToolButton& b) {
+    if (Cur()) return true;
+    return b.id == ID_MENU || b.id == ID_OPEN || b.id == ID_THUMBS || b.id == ID_MARKSPANE || b.id == -3;
 }
 
 static LRESULT CALLBACK ToolProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
+    case WM_CREATE:
+        g_tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, 0, 0, 0, 0, h,
+                                nullptr, g_inst, nullptr);
+        return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(h, &ps);
@@ -3215,59 +3704,56 @@ static LRESULT CALLBACK ToolProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         HDC buf = CreateCompatibleDC(hdc);
         HBITMAP bb = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
         HGDIOBJ oldb = SelectObject(buf, bb);
-        FillRect(buf, &rc, (HBRUSH)GetStockObject(WHITE_BRUSH));
-        RECT line = {0, rc.bottom - 1, rc.right, rc.bottom};
-        HBRUSH lb = CreateSolidBrush(RGB(0xD0, 0xD4, 0xDA));
-        FillRect(buf, &line, lb);
-        DeleteObject(lb);
+        FillSolid(buf, rc, g_c.surface);
+        FillSolid(buf, RECT{0, rc.bottom - 1, rc.right, rc.bottom}, g_c.border);
         SetBkMode(buf, TRANSPARENT);
-        bool have = Cur() != nullptr;
-        for (int i = 0; i < (int)(sizeof(g_buttons) / sizeof(g_buttons[0])); i++) {
+        Tab* t = Cur();
+        for (int i = 0; i < kButtonCount; i++) {
             auto& b = g_buttons[i];
-            if (b.id == 0) continue;
-            bool enabled = have || b.id == ID_OPEN || b.id == ID_THUMBS || b.id == ID_MARKSPANE;
-            bool active = (b.id == ID_THUMBS && g_showThumbs) || (b.id == ID_MARKSPANE && g_showMarks) || (have && b.id == ID_FITWIDTH && Cur()->fit == 1) ||
-                          (have && b.id == ID_FITPAGE && Cur()->fit == 2);
-            if ((i == g_hot && enabled) || active) {
-                HBRUSH hb = CreateSolidBrush(active ? RGB(0xE3, 0xEC, 0xFB) : RGB(0xEE, 0xF0, 0xF3));
-                HPEN np = (HPEN)GetStockObject(NULL_PEN);
-                HGDIOBJ op = SelectObject(buf, np), ob = SelectObject(buf, hb);
-                RoundRect(buf, b.rc.left, b.rc.top, b.rc.right, b.rc.bottom, S(6), S(6));
-                SelectObject(buf, op);
-                SelectObject(buf, ob);
-                DeleteObject(hb);
+            if (b.id == -1) {
+                int x = (b.rc.left + b.rc.right) / 2;
+                FillSolid(buf, RECT{x, b.rc.top + S(9), x + 1, b.rc.bottom - S(9)}, g_c.border);
+                continue;
             }
-            COLORREF col = enabled ? RGB(0x24, 0x29, 0x33) : RGB(0xB0, 0xB4, 0xBA);
-            SetTextColor(buf, col);
-            RECT g = b.rc;
-            g.left += S(8);
-            g.right = g.left + S(18);
-            if (!b.showLabel) { g = b.rc; }
-            SelectObject(buf, g_iconFont);
-            DrawTextW(buf, b.glyph, -1, &g, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-            if (b.showLabel) {
-                RECT tr = b.rc;
-                tr.left += S(30);
+            if (b.id == 0) {
+                RoundRectAA(buf, g_pageBoxRect, (float)S(8), g_c.input);
+                if (t) {
+                    wchar_t of[32];
+                    swprintf(of, 32, L"/ %d", t->pdf.PageCount());
+                    RECT r = {g_pageBoxRect.left + S(50), g_pageBoxRect.top, g_pageBoxRect.right - S(6), g_pageBoxRect.bottom};
+                    SelectObject(buf, g_font);
+                    SetTextColor(buf, g_c.muted);
+                    DrawTextW(buf, of, -1, &r, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                }
+                continue;
+            }
+            if (b.id == -3) {
+                bool focus = GetFocus() == g_findEdit;
+                RoundRectAA(buf, g_findRect, (float)S(10), g_c.input, focus ? g_c.accent : CLR_INVALID, 1.5f);
+                RECT g = {g_findRect.left + S(10), g_findRect.top, g_findRect.left + S(32), g_findRect.bottom};
+                SelectObject(buf, g_iconFont);
+                SetTextColor(buf, focus ? g_c.accent : g_c.muted);
+                DrawTextW(buf, L"\xE721", -1, &g, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                continue;
+            }
+            bool enabled = ButtonEnabled(b);
+            bool active = (b.id == ID_THUMBS && g_showThumbs) || (b.id == ID_MARKSPANE && g_showMarks);
+            COLORREF fill = CLR_INVALID;
+            if (active) fill = g_c.accentSoft;
+            if (enabled && b.hover > 0.01f) fill = Mix(active ? g_c.accentSoft : g_c.surface, active ? g_c.accentSoft : g_c.hover, b.hover);
+            if (enabled && i == g_pressedBtn && i == g_hot) fill = g_c.pressed;
+            RECT br = b.rc;
+            if (fill != CLR_INVALID) RoundRectAA(buf, br, (float)S(8), fill);
+            SetTextColor(buf, !enabled ? Mix(g_c.muted, g_c.surface, 0.45) : active ? g_c.accent : g_c.text);
+            if (b.id == -2) {
+                wchar_t z[16];
+                swprintf(z, 16, L"%d%%", t ? (int)lround(t->zoom * 100) : 100);
                 SelectObject(buf, g_font);
-                DrawTextW(buf, b.label, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                DrawTextW(buf, z, -1, &br, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                continue;
             }
-        }
-        // Magnifier in front of the search box.
-        {
-            RECT g = {g_findRect.left, 0, g_findRect.left + S(24), rc.bottom};
             SelectObject(buf, g_iconFont);
-            SetTextColor(buf, RGB(0x55, 0x5B, 0x66));
-            DrawTextW(buf, L"\xE721", -1, &g, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-        }
-        // "of N" next to the page box.
-        if (Cur()) {
-            wchar_t of[32];
-            swprintf(of, 32, L"of %d", Cur()->pdf.PageCount());
-            RECT r = g_pageBoxRect;
-            r.left += S(54);
-            SelectObject(buf, g_font);
-            SetTextColor(buf, RGB(0x44, 0x48, 0x50));
-            DrawTextW(buf, of, -1, &r, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            DrawTextW(buf, b.glyph, -1, &br, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         }
         BitBlt(hdc, 0, 0, rc.right, rc.bottom, buf, 0, 0, SRCCOPY);
         SelectObject(buf, oldb);
@@ -3280,15 +3766,33 @@ static LRESULT CALLBACK ToolProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 1;
     case WM_SIZE:
         LayoutToolbar();
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_TIMER:
+        if (w == kHoverTimer) {
+            // Hover fades in and out over about 100 ms.
+            bool moving = false;
+            for (int i = 0; i < kButtonCount; i++) {
+                float target = i == g_hot ? 1.0f : 0.0f;
+                float& v = g_buttons[i].hover;
+                if (std::fabs(v - target) > 0.01f) {
+                    v += (target - v) * 0.35f + (target > v ? 0.05f : -0.05f);
+                    v = std::clamp(v, 0.0f, 1.0f);
+                    moving = true;
+                } else v = target;
+            }
+            InvalidateRect(h, nullptr, FALSE);
+            if (!moving) KillTimer(h, kHoverTimer);
+        }
         return 0;
     case WM_MOUSEMOVE: {
         POINT p = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
         int hot = -1;
-        for (int i = 0; i < (int)(sizeof(g_buttons) / sizeof(g_buttons[0])); i++)
-            if (g_buttons[i].id && PtInRect(&g_buttons[i].rc, p)) hot = i;
+        for (int i = 0; i < kButtonCount; i++)
+            if (g_buttons[i].id != -1 && g_buttons[i].id != 0 && g_buttons[i].id != -3 && PtInRect(&g_buttons[i].rc, p)) hot = i;
         if (hot != g_hot) {
             g_hot = hot;
-            InvalidateRect(h, nullptr, FALSE);
+            SetTimer(h, kHoverTimer, 15, nullptr);
             TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, h, 0};
             TrackMouseEvent(&tme);
         }
@@ -3296,16 +3800,34 @@ static LRESULT CALLBACK ToolProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_MOUSELEAVE:
         g_hot = -1;
-        InvalidateRect(h, nullptr, FALSE);
+        SetTimer(h, kHoverTimer, 15, nullptr);
         return 0;
-    case WM_LBUTTONUP: {
+    case WM_LBUTTONDOWN: {
         POINT p = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
-        for (auto& b : g_buttons)
-            if (b.id && PtInRect(&b.rc, p)) SendMessageW(g_main, WM_COMMAND, b.id, 0);
+        if (PtInRect(&g_findRect, p)) { SetFocus(g_findEdit); return 0; }
+        if (PtInRect(&g_pageBoxRect, p) && Cur()) { SetFocus(g_pageEdit); SendMessageW(g_pageEdit, EM_SETSEL, 0, -1); return 0; }
+        g_pressedBtn = g_hot;
+        if (g_hot >= 0) { SetCapture(h); InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        int i = g_pressedBtn;
+        g_pressedBtn = -1;
+        if (GetCapture() == h) ReleaseCapture();
+        InvalidateRect(h, nullptr, FALSE);
+        if (i < 0 || i != g_hot || !ButtonEnabled(g_buttons[i])) return 0;
+        if (g_buttons[i].id == ID_MENU) ShowAppMenu();
+        else if (g_buttons[i].id == -2) ShowZoomMenu(g_buttons[i].rc);
+        else SendMessageW(g_main, WM_COMMAND, g_buttons[i].id, 0);
         return 0;
     }
     case WM_CTLCOLOREDIT:
-        return (LRESULT)GetStockObject(WHITE_BRUSH);
+        SetTextColor((HDC)w, g_c.text);
+        SetBkColor((HDC)w, g_c.input);
+        return (LRESULT)g_inputBrush;
+    case WM_COMMAND:
+        if (HIWORD(w) == EN_SETFOCUS || HIWORD(w) == EN_KILLFOCUS) InvalidateRect(h, nullptr, FALSE);
+        return 0;
     }
     return DefWindowProcW(h, m, w, l);
 }
@@ -3332,20 +3854,17 @@ static LRESULT CALLBACK PageEditProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 static int TabStripHeight() {
     if (g_docs.empty()) return 0;
     RECT r;
-    if (TabCtrl_GetItemRect(g_tabs, 0, &r)) return r.bottom + S(2);
+    (void)r;
+    return S(44);
     return S(28);
 }
 
 static void RelayoutMain() {
     RECT rc;
     GetClientRect(g_main, &rc);
-    SendMessageW(g_status, WM_SIZE, 0, 0);
-    RECT sr;
-    GetWindowRect(g_status, &sr);
-    int statusH = sr.bottom - sr.top;
-    int parts[4] = {rc.right - S(380), rc.right - S(250), rc.right - S(170), -1};
-    SendMessageW(g_status, SB_SETPARTS, 4, (LPARAM)parts);
-    int toolH = S(40);
+    int statusH = S(30);
+    MoveWindow(g_status, 0, rc.bottom - statusH, rc.right, statusH, TRUE);
+    int toolH = S(54);
     MoveWindow(g_tool, 0, 0, rc.right, toolH, TRUE);
     int tabH = TabStripHeight();
     ShowWindow(g_tabs, tabH ? SW_SHOW : SW_HIDE);
@@ -3353,7 +3872,7 @@ static void RelayoutMain() {
     int y = toolH + tabH;
     int h = std::max(0, (int)rc.bottom - statusH - y);
     int thumbW = g_showThumbs ? (g_sideMode ? S(250) : S(212)) : 0;
-    int sideH = S(30);
+    int sideH = S(46);
     ShowWindow(g_side, g_showThumbs ? SW_SHOW : SW_HIDE);
     MoveWindow(g_side, 0, y, thumbW, sideH, TRUE);
     ShowWindow(g_thumbs, g_showThumbs && g_sideMode == 0 ? SW_SHOW : SW_HIDE);
@@ -3371,8 +3890,29 @@ static void CreateFonts() {
     if (g_font) DeleteObject(g_font);
     if (g_iconFont) DeleteObject(g_iconFont);
     if (g_bigFont) DeleteObject(g_bigFont);
-    g_font = CreateFontW(-S(13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    g_bigFont = CreateFontW(-S(22), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    for (HFONT f : {g_smallFont, g_headFont, g_titleFont, g_btnFont, g_logoFont}) if (f) DeleteObject(f);
+    auto exists = [](const wchar_t* face) {
+        HDC dc = GetDC(nullptr);
+        LOGFONTW lf = {};
+        lf.lfCharSet = DEFAULT_CHARSET;
+        wcscpy_s(lf.lfFaceName, face);
+        bool found = false;
+        EnumFontFamiliesExW(dc, &lf, [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM p) -> int { *(bool*)p = true; return 0; }, (LPARAM)&found, 0);
+        ReleaseDC(nullptr, dc);
+        return found;
+    };
+    // Windows 11's Segoe UI Variable where it exists; Segoe UI otherwise.
+    const wchar_t* ui = exists(L"Segoe UI Variable Text") ? L"Segoe UI Variable Text" : L"Segoe UI";
+    const wchar_t* disp = exists(L"Segoe UI Variable Display") ? L"Segoe UI Variable Display" : L"Segoe UI";
+    auto mk = [](int px, int weight, const wchar_t* face) {
+        return CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, face);
+    };
+    g_font = mk(S(14), FW_NORMAL, ui);
+    g_smallFont = mk(S(13), FW_NORMAL, ui);
+    g_headFont = mk(S(11), FW_SEMIBOLD, ui);
+    g_btnFont = mk(S(15), FW_SEMIBOLD, ui);
+    g_bigFont = mk(S(22), FW_SEMIBOLD, disp);
+    g_titleFont = mk(S(32), FW_SEMIBOLD, disp);
     // Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets on Windows 10.
     const wchar_t* face = L"Segoe Fluent Icons";
     HDC hdc = GetDC(nullptr);
@@ -3383,11 +3923,13 @@ static void CreateFonts() {
     EnumFontFamiliesExW(hdc, &lf, [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM p) -> int { *(bool*)p = true; return 0; }, (LPARAM)&found, 0);
     ReleaseDC(nullptr, hdc);
     if (!found) face = L"Segoe MDL2 Assets";
-    g_iconFont = CreateFontW(-S(15), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, face);
+    g_iconFace = face;
+    g_iconFont = CreateFontW(-S(16), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, face);
+    g_logoFont = CreateFontW(-S(32), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, face);
     if (g_pageEdit) SendMessageW(g_pageEdit, WM_SETFONT, (WPARAM)g_font, TRUE);
     if (g_findEdit) SendMessageW(g_findEdit, WM_SETFONT, (WPARAM)g_font, TRUE);
     if (g_navList) SendMessageW(g_navList, WM_SETFONT, (WPARAM)g_font, TRUE);
-    if (g_tabs) SendMessageW(g_tabs, WM_SETFONT, (WPARAM)g_font, TRUE);
+    if (g_navList) SendMessageW(g_navList, LB_SETITEMHEIGHT, 0, S(34));
 }
 
 static void SavePlacement() {
@@ -3441,26 +3983,28 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_dpi = GetDpiForWindow(h);
         CreateFonts();
         g_tool = CreateWindowExW(0, kToolClass, nullptr, WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 0, 0, h, nullptr, g_inst, nullptr);
-        g_pageEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_CENTER | ES_NUMBER | ES_AUTOHSCROLL,
+        g_pageEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_CENTER | ES_NUMBER | ES_AUTOHSCROLL,
                                      0, 0, 0, 0, g_tool, (HMENU)(INT_PTR)ID_PAGEEDIT, g_inst, nullptr);
         g_editProc = (WNDPROC)SetWindowLongPtrW(g_pageEdit, GWLP_WNDPROC, (LONG_PTR)PageEditProc);
-        g_findEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, g_tool,
+        g_findEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, g_tool,
                                      (HMENU)(INT_PTR)ID_FINDEDIT, g_inst, nullptr);
-        SendMessageW(g_findEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search  (Ctrl+F)");
+        SendMessageW(g_findEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search this file");
         g_findProc = (WNDPROC)SetWindowLongPtrW(g_findEdit, GWLP_WNDPROC, (LONG_PTR)FindEditProc);
         g_side = CreateWindowExW(0, kSideClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, h, nullptr, g_inst, nullptr);
-        g_navList = CreateWindowExW(0, L"LISTBOX", nullptr, WS_CHILD | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS,
+        g_navList = CreateWindowExW(0, L"LISTBOX", nullptr,
+                                    WS_CHILD | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS | LBS_OWNERDRAWFIXED,
                                     0, 0, 0, 0, h, (HMENU)(INT_PTR)ID_NAVLIST, g_inst, nullptr);
         SetTimer(h, kRecoveryTimer, 60 * 1000, nullptr);
-        g_tabs = CreateWindowExW(0, WC_TABCONTROLW, nullptr, WS_CHILD | WS_CLIPSIBLINGS | TCS_FOCUSNEVER | TCS_TOOLTIPS, 0, 0, 0, 0, h,
+        g_tabs = CreateWindowExW(0, kTabsClass, nullptr, WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 0, 0, h,
                                  (HMENU)(INT_PTR)ID_TABS, g_inst, nullptr);
         g_thumbs = CreateWindowExW(0, kThumbClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, h, nullptr, g_inst, nullptr);
         g_marks = CreateWindowExW(0, kMarksClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, h, nullptr, g_inst, nullptr);
         g_view = CreateWindowExW(0, kViewClass, nullptr, WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | WS_TABSTOP, 0, 0, 0, 0, h,
                                  nullptr, g_inst, nullptr);
-        g_status = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr, WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, h,
+        g_status = CreateWindowExW(0, kStatusClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, h,
                                    (HMENU)(INT_PTR)ID_STATUS, g_inst, nullptr);
         CreateFonts();
+        ApplyTheme();
         RegisterDragDrop(h, new DropTarget());
         RelayoutMain();
         UpdateStatus();
@@ -3469,6 +4013,59 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SIZE:
         RelayoutMain();
         return 0;
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO* mi = (MINMAXINFO*)l;
+        mi->ptMinTrackSize = POINT{S(860), S(560)};
+        return 0;
+    }
+    case WM_APP_CLOSETAB:
+        CloseTab((int)w);
+        return 0;
+    case WM_SYSCOMMAND:
+        // Alt (or F10) opens the app menu, since there is no menu bar.
+        if ((w & 0xFFF0) == SC_KEYMENU) { ShowAppMenu(); return 0; }
+        break;
+    case WM_SETTINGCHANGE:
+        if (l && wcscmp((const wchar_t*)l, L"ImmersiveColorSet") == 0 && g_themePref == 0 && g_themeOverride < 0) ApplyTheme();
+        break;
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT* mi = (MEASUREITEMSTRUCT*)l;
+        if (mi->CtlID == ID_NAVLIST) { mi->itemHeight = S(34); return TRUE; }
+        break;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* di = (DRAWITEMSTRUCT*)l;
+        if (di->CtlID != ID_NAVLIST) break;
+        RECT r = di->rcItem;
+        FillSolid(di->hDC, r, g_c.surface);
+        if (di->itemID == (UINT)-1) return TRUE;
+        RECT card = r;
+        InflateRect(&card, -S(8), -S(2));
+        if (di->itemState & ODS_SELECTED) RoundRectAA(di->hDC, card, (float)S(8), g_c.accentSoft);
+        int len = (int)SendMessageW(di->hwndItem, LB_GETTEXTLEN, di->itemID, 0);
+        std::wstring text(std::max(0, len), L'\0');
+        if (len > 0) SendMessageW(di->hwndItem, LB_GETTEXT, di->itemID, (LPARAM)&text[0]);
+        SetBkMode(di->hDC, TRANSPARENT);
+        SelectObject(di->hDC, g_smallFont);
+        RECT tr = {card.left + S(10), card.top, card.right - S(8), card.bottom};
+        // "p. 3   Tickmark: note" draws the page as a small badge.
+        if (text.rfind(L"p. ", 0) == 0) {
+            size_t sp = text.find(L"   ");
+            std::wstring pg = text.substr(3, sp == std::wstring::npos ? std::wstring::npos : sp - 3);
+            RECT badge = {tr.left, card.top + S(6), tr.left + S(34), card.bottom - S(6)};
+            RoundRectAA(di->hDC, badge, (float)S(6), g_c.input);
+            SetTextColor(di->hDC, g_c.text2);
+            DrawTextW(di->hDC, pg.c_str(), -1, &badge, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            text = sp == std::wstring::npos ? L"" : text.substr(sp + 3);
+            tr.left = badge.right + S(10);
+        }
+        bool empty = di->itemID < g_navItems.size() && g_navItems[di->itemID].page < 0;
+        SetTextColor(di->hDC, empty ? g_c.muted : (di->itemState & ODS_SELECTED) ? g_c.accent : g_c.text);
+        DrawTextW(di->hDC, text.c_str(), -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        return TRUE;
+    }
+    case WM_CTLCOLORLISTBOX:
+        return (LRESULT)g_surfaceBrush;
     case WM_TIMER:
         if (w == kNavTimer) { KillTimer(h, kNavTimer); if (g_sideMode) FillNavList(); }
         if (w == kRecoveryTimer) SaveRecovery();
@@ -3521,6 +4118,10 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_ZOOMIN: ZoomStep(t, 1, nullptr); break;
         case ID_ZOOMOUT: ZoomStep(t, -1, nullptr); break;
         case ID_ZOOM100: SetZoom(t, 1.0, 0, nullptr); break;
+        case ID_ZOOMPRESET: case ID_ZOOMPRESET + 1: case ID_ZOOMPRESET + 2: case ID_ZOOMPRESET + 3:
+        case ID_ZOOMPRESET + 4: case ID_ZOOMPRESET + 5: case ID_ZOOMPRESET + 6: case ID_ZOOMPRESET + 7:
+            SetZoom(t, kZoomPresets[LOWORD(w) - ID_ZOOMPRESET] / 100.0, 0, nullptr);
+            break;
         case ID_FITWIDTH: SetZoom(t, t ? t->zoom : 1, 1, nullptr); break;
         case ID_FITPAGE:
             if (t) { SetZoom(t, t->zoom, 2, nullptr); GoToPage(t, CurrentPage(t)); }
@@ -3580,6 +4181,13 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 ShellExecuteW(h, L"open", L"ms-settings:defaultapps", nullptr, nullptr, SW_SHOWNORMAL);
             break;
         case ID_FIND: SetFocus(g_findEdit); SendMessageW(g_findEdit, EM_SETSEL, 0, -1); break;
+        case ID_MENU: ShowAppMenu(); break;
+        case ID_THEME_SYS: case ID_THEME_LIGHT: case ID_THEME_DARK:
+            g_themePref = LOWORD(w) - ID_THEME_SYS;
+            g_themeOverride = -1;
+            RegSetDword(nullptr, L"Theme", (DWORD)g_themePref);
+            ApplyTheme();
+            break;
         case ID_FINDNEXT: DoFind(false); break;
         case ID_FINDPREV: DoFind(true); break;
         case ID_PRINT: PrintDoc(t, true); break;
@@ -3642,7 +4250,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static HMENU BuildMenu() {
-    HMENU bar = CreateMenu(), file = CreatePopupMenu(), edit = CreatePopupMenu(), pages = CreatePopupMenu(), view = CreatePopupMenu(),
+    HMENU bar = CreatePopupMenu(), file = CreatePopupMenu(), edit = CreatePopupMenu(), pages = CreatePopupMenu(), view = CreatePopupMenu(),
           help = CreatePopupMenu(), tools = CreatePopupMenu();
     AppendMenuW(tools, MF_STRING, ID_TOOL_HAND, L"&Hand\tEsc");
     AppendMenuW(tools, MF_STRING, ID_TOOL_SELECT, L"&Select marks and comments\tS");
@@ -3702,6 +4310,13 @@ static HMENU BuildMenu() {
     AppendMenuW(view, MF_STRING, ID_SIDE_PAGES, L"Side pane: pa&ges");
     AppendMenuW(view, MF_STRING, ID_SIDE_OUTLINE, L"Side pane: &bookmarks");
     AppendMenuW(view, MF_STRING, ID_SIDE_COMMENTS, L"Side pane: &comments list");
+    HMENU theme = CreatePopupMenu();
+    AppendMenuW(theme, MF_STRING, ID_THEME_SYS, L"Match Windows");
+    AppendMenuW(theme, MF_STRING, ID_THEME_LIGHT, L"Light");
+    AppendMenuW(theme, MF_STRING, ID_THEME_DARK, L"Dark");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(view, MF_POPUP, (UINT_PTR)theme, L"T&heme");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(view, MF_STRING, ID_NEXTTAB, L"Next tab\tCtrl+Tab");
     AppendMenuW(view, MF_STRING, ID_PREVTAB, L"Previous tab\tCtrl+Shift+Tab");
     AppendMenuW(help, MF_STRING, ID_GUIDE, L"&Quick guide");
@@ -3748,6 +4363,7 @@ static HACCEL BuildAccel() {
         {FCONTROL | FVIRTKEY, 'D', ID_DUP},
         {FCONTROL | FVIRTKEY, 'A', ID_SELECTALL},
         {FCONTROL | FVIRTKEY, 'F', ID_FIND},
+        {FVIRTKEY, VK_F10, ID_MENU},
         {FVIRTKEY, VK_F3, ID_FINDNEXT},
         {FSHIFT | FVIRTKEY, VK_F3, ID_FINDPREV},
         {FCONTROL | FVIRTKEY, 'P', ID_PRINT},
@@ -3837,14 +4453,24 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argc == 4 && wcscmp(argv[1], L"--benchmark") == 0) return RunBenchmark(argv[2], argv[3]);
+    // --theme light|dark (for screenshots) applies to this run only.
+    std::vector<std::wstring> files;
+    for (int i = 1; i < argc; i++) {
+        if (wcscmp(argv[i], L"--theme") == 0 && i + 1 < argc) {
+            g_themeOverride = wcscmp(argv[i + 1], L"dark") == 0 ? 2 : 1;
+            i++;
+            continue;
+        }
+        files.push_back(argv[i]);
+    }
     if (argc >= 4 && wcscmp(argv[1], L"--combine") == 0) return RunCombine(argc, argv);
 
     // One window for the whole app: hand files to a copy that is already running.
     HWND existing = FindWindowW(kMainClass, nullptr);
     if (existing) {
-        for (int i = 1; i < argc; i++) {
+        for (auto& f : files) {
             wchar_t full[MAX_PATH * 4];
-            GetFullPathNameW(argv[i], MAX_PATH * 4, full, nullptr);
+            GetFullPathNameW(f.c_str(), MAX_PATH * 4, full, nullptr);
             COPYDATASTRUCT cd = {1, (DWORD)((wcslen(full) + 1) * sizeof(wchar_t)), full};
             SendMessageW(existing, WM_COPYDATA, 0, (LPARAM)&cd);
         }
@@ -3857,6 +4483,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_TAB_CLASSES | ICC_BAR_CLASSES};
     InitCommonControlsEx(&icc);
     PdfInit();
+    Gdiplus::GdiplusStartupInput gsi;
+    ULONG_PTR gdipToken = 0;
+    Gdiplus::GdiplusStartup(&gdipToken, &gsi, nullptr);
+    DWORD themePref;
+    if (RegGetDword(nullptr, L"Theme", themePref)) g_themePref = std::clamp((int)themePref, 0, 2);
+    ApplyTheme();
+    LoadRecent();
 
     HICON icon = LoadIconW(inst, MAKEINTRESOURCEW(IDI_APP));
     Register(kMainClass, MainProc, LoadCursor(nullptr, IDC_ARROW), nullptr, icon);
@@ -3866,13 +4499,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     LoadMarkSettings();
     Register(kToolClass, ToolProc, LoadCursor(nullptr, IDC_ARROW), nullptr, nullptr);
     Register(kSideClass, SideProc, LoadCursor(nullptr, IDC_HAND), nullptr, nullptr);
+    Register(kTabsClass, TabsProc, LoadCursor(nullptr, IDC_ARROW), nullptr, nullptr);
+    Register(kStatusClass, StatusProc, LoadCursor(nullptr, IDC_ARROW), nullptr, nullptr);
 
     DWORD th;
     if (RegGetDword(nullptr, L"Thumbnails", th)) g_showThumbs = th != 0;
     if (RegGetDword(nullptr, L"SideMode", th)) g_sideMode = std::clamp((int)th, 0, 2);
 
+    g_menu = BuildMenu();
     HWND h = CreateWindowExW(0, kMainClass, APP_NAME, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 1280, 860,
-                             nullptr, BuildMenu(), inst, nullptr);
+                             nullptr, nullptr, inst, nullptr);
     WINDOWPLACEMENT wp = {};
     DWORD sz = sizeof(wp);
     bool placed = false;
@@ -3885,9 +4521,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     if (!placed) ShowWindow(h, show);
     UpdateWindow(h);
 
-    for (int i = 1; i < argc; i++) {
+    for (auto& f : files) {
         wchar_t full[MAX_PATH * 4];
-        GetFullPathNameW(argv[i], MAX_PATH * 4, full, nullptr);
+        GetFullPathNameW(f.c_str(), MAX_PATH * 4, full, nullptr);
         OpenFile(full);
     }
     LocalFree(argv);
@@ -3917,6 +4553,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
         DispatchMessageW(&msg);
     }
     PdfShutdown();
+    Gdiplus::GdiplusShutdown(gdipToken);
     OleUninitialize();
     return 0;
 }

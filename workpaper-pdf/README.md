@@ -2,11 +2,13 @@
 
 A fast PDF app for audit workpapers. Opens in a blink, no account, no auto-updates, no background services.
 
-**This is build 6**, the first full team release. It views, searches and prints PDFs, organizes pages,
-adds tickmarks and comments, and edits text.
+**This is build 7**, with a fresh look: a clean toolbar, rounded tabs, a start screen with your recent
+files, and light and dark themes. It views, searches and prints PDFs, organizes pages, adds tickmarks and
+comments, and edits text.
 
 **Quick start:** open a PDF (drag it on, or Ctrl+O). Press F6 for the Marks pane, pick a tickmark, click the page.
-Press E and click a line to fix text. Ctrl+S saves. Help > Quick guide opens this guide.
+Press E and click a line to fix text. Ctrl+S saves. All commands are in the **menu button** at the top left (or press Alt or F10);
+Menu > Help > Quick guide opens this guide.
 
 ## Install
 
@@ -32,6 +34,11 @@ No installer? The zip version runs without installing: unzip it anywhere and run
 - **Zoom:** Ctrl + mouse wheel, Ctrl+plus / Ctrl+minus, Ctrl+0 actual size, Ctrl+1 fit width, Ctrl+2 fit page.
 - **Tabs:** Ctrl+Tab to switch, Ctrl+W or middle-click a tab to close.
 - The app remembers the last page you were on in each file, and its window size.
+- **Start screen:** with no file open, the app shows your recent files. Click one to reopen it.
+- **Menu:** the button at the far left of the toolbar (or Alt / F10) holds every command: File, Edit, View,
+  Pages, Marks and Help. Hover any toolbar button to see what it does and its shortcut.
+- **Zoom menu:** click the zoom percentage in the toolbar to pick a size, fit width or fit page.
+- **Light or dark:** Menu > View > Theme. **Match Windows** (the default) follows your Windows setting.
 
 ## Search, print and side pane
 

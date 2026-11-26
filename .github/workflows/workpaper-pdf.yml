@@ -79,17 +79,23 @@ jobs:
       - name: Screenshot check
         shell: pwsh
         run: |
-          $p = Start-Process build\Release\WorkpaperPDF.exe -ArgumentList "`"$PWD\tests\sample-60-pages.pdf`"" -PassThru
-          Start-Sleep -Seconds 6
-          if ($p.HasExited) { throw "the app closed by itself (exit code $($p.ExitCode))" }
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-          $g = [System.Drawing.Graphics]::FromImage($bmp)
-          $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
           New-Item -ItemType Directory -Force dist | Out-Null
-          $bmp.Save("$PWD\dist\screenshot.png", [System.Drawing.Imaging.ImageFormat]::Png)
-          Stop-Process -Id $p.Id
+          function Shot($argList, $out) {
+            $p = Start-Process build\Release\WorkpaperPDF.exe -ArgumentList $argList -WindowStyle Maximized -PassThru
+            Start-Sleep -Seconds 6
+            if ($p.HasExited) { throw "the app closed by itself (exit code $($p.ExitCode))" }
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save("$PWD\dist\$out", [System.Drawing.Imaging.ImageFormat]::Png)
+            Stop-Process -Id $p.Id
+            Start-Sleep -Seconds 2
+          }
+          Shot @('--theme', 'light', "`"$PWD\tests\sample-60-pages.pdf`"") 'screenshot.png'
+          Shot @('--theme', 'dark', "`"$PWD\tests\sample-60-pages.pdf`"") 'screenshot-dark.png'
+          Shot @('--theme', 'light') 'screenshot-start.png'
 
       - name: Package
         shell: pwsh
@@ -111,7 +117,7 @@ jobs:
           path: |
             workpaper-pdf/dist/WorkpaperPDF-Setup.exe
             workpaper-pdf/dist/WorkpaperPDF-portable.zip
-            workpaper-pdf/dist/screenshot.png
+            workpaper-pdf/dist/screenshot*.png
             workpaper-pdf/speed.txt
             workpaper-pdf/convtest/out.pdf
 
@@ -123,4 +129,4 @@ jobs:
           $tag = "workpaper-pdf-latest"
           gh release delete $tag --yes --cleanup-tag 2>$null
           $notes = "Latest build of Workpaper PDF from branch $env:GITHUB_REF_NAME ($env:GITHUB_SHA).`n`nSpeed check:`n" + ((Get-Content speed.txt) -join "`n")
-          gh release create $tag dist\WorkpaperPDF-Setup.exe dist\WorkpaperPDF-portable.zip dist\screenshot.png speed.txt --title "Workpaper PDF (latest build)" --notes $notes --target $env:GITHUB_SHA --prerelease
+          gh release create $tag dist\WorkpaperPDF-Setup.exe dist\WorkpaperPDF-portable.zip dist\screenshot.png dist\screenshot-dark.png dist\screenshot-start.png speed.txt --title "Workpaper PDF (latest build)" --notes $notes --target $env:GITHUB_SHA --prerelease
