@@ -100,6 +100,35 @@ struct Canvas {
         objs.push_back(t);
         FPDFFont_Close(font);
     }
+    // Bold text centred across the width with its baseline at y. Bytes are Latin-1.
+    void TextAt(const std::string& s, double size, double w, double y) {
+        End();
+        FPDF_FONT font = FPDFText_LoadStandardFont(doc, "Helvetica-Bold");
+        FPDF_PAGEOBJECT t = FPDFPageObj_CreateTextObj(doc, font, (float)size);
+        std::vector<unsigned short> u;
+        for (unsigned char ch : s) u.push_back(ch);
+        u.push_back(0);
+        FPDFText_SetText(t, u.data());
+        FPDFPageObj_SetFillColor(t, r, g, b, 255);
+        float l, bo, ri, to;
+        FPDFPageObj_GetBounds(t, &l, &bo, &ri, &to);
+        FPDFPageObj_Transform(t, 1, 0, 0, 1, (w - (ri - l)) / 2 - l, y);
+        objs.push_back(t);
+        FPDFFont_Close(font);
+    }
+    void RoundRect(double x, double y, double w, double h, double rad) {
+        const double c = 0.5523 * rad;
+        Move(x + rad, y);
+        Line(x + w - rad, y);
+        Curve(x + w - rad + c, y, x + w, y + rad - c, x + w, y + rad);
+        Line(x + w, y + h - rad);
+        Curve(x + w, y + h - rad + c, x + w - rad + c, y + h, x + w - rad, y + h);
+        Line(x + rad, y + h);
+        Curve(x + rad - c, y + h, x, y + h - rad + c, x, y + h - rad);
+        Line(x, y + rad);
+        Curve(x, y + rad - c, x + rad - c, y, x + rad, y);
+        Close();
+    }
 };
 
 typedef void (*DrawFn)(Canvas& c, double w, double h);
@@ -184,11 +213,27 @@ static double TextWidth(const std::string& s, double size) {
     return w * size / 1000.0;
 }
 
+// Sign-off stamp layout at Medium size, in points.
+static const double kSignHead = 6.2, kSignText = 10.5, kSignH = 30, kSignPad = 7;
+static const char* kSignHeads[2] = {"PREPARED BY", "REVIEWED BY"};
+const char* SignoffHeading(Kind kind) { return kSignHeads[kind == kReviewed ? 1 : 0]; }
+static bool IsSignoff(Kind kind) { return kind == kPrepared || kind == kReviewed; }
+// The heading is drawn letter-spaced, like a printed rubber stamp.
+static std::string Spaced(const char* s) {
+    std::string out;
+    for (const char* p = s; *p; p++) { out += *p; if (p[1]) out += ' '; }
+    return out;
+}
+
 static double SymbolTextSize(const char* t) { return (t[1] == 0 && (t[0] == '?' || t[0] == '!')) ? 15 : 13; }
 static double CircledTextSize(const std::string& t) { return t.size() > 1 ? 9.5 : 11.5; }
 
 void BaseSize(Kind kind, int symbol, const std::string& text, double& w, double& h) {
-    if (kind == kSymbol) {
+    if (IsSignoff(kind)) {
+        h = kSignH;
+        w = std::max(TextWidth(Spaced(SignoffHeading(kind)), kSignHead), TextWidth(text, kSignText)) + 2 * kSignPad;
+        w = std::max(w, 64.0);
+    } else if (kind == kSymbol) {
         const Symbol& s = kSymbols[std::clamp(symbol, 0, SymbolCount() - 1)];
         h = s.h;
         w = s.draw ? s.w : std::max(20.0, TextWidth(s.text, SymbolTextSize(s.text)) + 6);
@@ -221,7 +266,18 @@ bool AddMark(FPDF_DOCUMENT doc, FPDF_PAGE page, Kind kind, int symbol, const std
     Canvas c{doc};
     ColorRgb(color, c.r, c.g, c.b);
     std::string id;
-    if (kind == kSymbol) {
+    if (IsSignoff(kind)) {
+        id = kind == kPrepared ? "prepared" : "reviewed";
+        // A rounded frame, a divider, the letter-spaced heading and the sign-off text below it.
+        c.width = 1.3;
+        c.RoundRect(0.9, 0.9, w - 1.8, h - 1.8, 4);
+        c.End();
+        c.width = 0.6;
+        c.Seg(kSignPad, h - 11.5, w - kSignPad, h - 11.5);
+        c.End();
+        c.TextAt(Spaced(SignoffHeading(kind)), kSignHead, w, h - 8.6);
+        c.TextAt(text, kSignText, w, 6.2);
+    } else if (kind == kSymbol) {
         const Symbol& s = kSymbols[std::clamp(symbol, 0, SymbolCount() - 1)];
         id = s.id;
         if (s.draw) s.draw(c, w, h);
@@ -274,7 +330,7 @@ bool AddMark(FPDF_DOCUMENT doc, FPDF_PAGE page, Kind kind, int symbol, const std
     }
     std::string now = PdfDate();
     FPDFAnnot_SetStringValue(annot, "T", (FPDF_WIDESTRING)author.c_str());
-    FPDFAnnot_SetStringValue(annot, "Subj", (FPDF_WIDESTRING)u"Tickmark");
+    FPDFAnnot_SetStringValue(annot, "Subj", (FPDF_WIDESTRING)(kind == kPrepared ? u"Prepared by" : kind == kReviewed ? u"Reviewed by" : u"Tickmark"));
     FPDFAnnot_SetStringValue(annot, "M", (FPDF_WIDESTRING)U16(now).c_str());
     FPDFAnnot_SetStringValue(annot, "CreationDate", (FPDF_WIDESTRING)U16(now).c_str());
     FPDFAnnot_SetStringValue(annot, "NM", (FPDF_WIDESTRING)U16(nm).c_str());

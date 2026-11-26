@@ -7,7 +7,11 @@
 
 namespace marks {
 
-enum Kind { kSymbol = 0, kNumber, kLetter };
+enum Kind { kSymbol = 0, kNumber, kLetter, kPrepared, kReviewed };
+
+// Sign-off stamps (kPrepared, kReviewed) show a heading ("PREPARED BY") over `text`,
+// usually the person's initials and the date, e.g. "MJ  11/26/2026". Latin-1 text.
+const char* SignoffHeading(Kind kind);
 
 int SymbolCount();
 const char* SymbolId(int i);
@@ -25,7 +29,7 @@ double SizeScale(int i);
 std::string NumberText(int n);
 std::string LetterText(int i);
 
-// Size of the mark in points at scale 1 (Medium). `text` is used for number and letter marks.
+// Size of the mark in points at scale 1 (Medium). `text` is used for number, letter and sign-off marks.
 void BaseSize(Kind kind, int symbol, const std::string& text, double& w, double& h);
 
 // Adds a mark as a Stamp annotation filling the page-space box (left, bottom, right, top).
@@ -36,7 +40,7 @@ bool AddMark(FPDF_DOCUMENT doc, FPDF_PAGE page, Kind kind, int symbol, const std
              double left, double bottom, double right, double top, int rotation, const std::u16string& author,
              const std::string& nm);
 
-// True if the annotation is one of our tickmarks.
+// True if the annotation is one of our tickmarks (sign-off stamps included).
 bool IsMark(FPDF_ANNOTATION annot);
 
 }  // namespace marks

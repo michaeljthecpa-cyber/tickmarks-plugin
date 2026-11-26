@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+#include <string>
 #include <vector>
 #include "fpdf_annot.h"
 #include "fpdf_edit.h"
@@ -33,16 +34,24 @@ int main(int argc, char** argv) {
     CHECK(annots::AddShape(p, true, {300, 600, 420, 640}, 0, 140, 46, 1.5f, u"Tester", id5));
     std::vector<FS_POINTF> s1 = {{100, 500}, {120, 520}, {140, 505}, {160, 530}};
     CHECK(annots::AddInk(p, {s1}, 128, 31, 173, 2.0f, u"Tester", id6));
+    // Sign-off stamps: Prepared by and Reviewed by, sized from BaseSize like a click on the page.
+    std::string id8 = annots::NewId("tm"), id9 = annots::NewId("tm");
+    double sw, sh;
+    marks::BaseSize(marks::kPrepared, 0, "MJ  11/26/2026", sw, sh);
+    CHECK(sw > 64 && sh == 30);
+    CHECK(marks::AddMark(d, p, marks::kPrepared, 0, "MJ  11/26/2026", 1, 420, 740, 420 + sw, 740 + sh, 0, u"Tester", id8));
+    marks::BaseSize(marks::kReviewed, 0, "KL  11/27/2026", sw, sh);
+    CHECK(marks::AddMark(d, p, marks::kReviewed, 0, "KL  11/27/2026", 2, 510, 740, 510 + sw, 740 + sh, 0, u"Tester", id9));
 
     auto list = annots::List(p);
-    CHECK(list.size() == 7);
+    CHECK(list.size() == 9);
     int marksFound = 0;
     for (int i = 0; i < FPDFPage_GetAnnotCount(p); i++) {
         FPDF_ANNOTATION a = FPDFPage_GetAnnot(p, i);
         if (marks::IsMark(a)) marksFound++;
         FPDFPage_CloseAnnot(a);
     }
-    CHECK(marksFound == 2);
+    CHECK(marksFound == 4);
     CHECK(annots::Find(p, id3) >= 0);
     CHECK(annots::SetContents(p, id3, u"Agreed to bank statement, no exceptions"));
     for (auto& i : annots::List(p)) if (i.nm == id3) CHECK(i.contents == u"Agreed to bank statement, no exceptions");
@@ -52,7 +61,7 @@ int main(int argc, char** argv) {
     // Undo-style removal of the number mark.
     CHECK(annots::Remove(p, id7));
     CHECK(annots::Find(p, id7) < 0);
-    CHECK(annots::List(p).size() == 6);
+    CHECK(annots::List(p).size() == 8);
     FPDF_ClosePage(p);
 
     std::vector<uint8_t> out;
@@ -62,7 +71,18 @@ int main(int argc, char** argv) {
     fclose(fo);
     FPDF_DOCUMENT d2 = FPDF_LoadMemDocument64(out.data(), out.size(), nullptr);
     FPDF_PAGE p2 = FPDF_LoadPage(d2, 0);
-    CHECK(annots::List(p2).size() == 6);
+    CHECK(annots::List(p2).size() == 8);
+    // The sign-offs survive a save, keep their subject (shown in Acrobat's comment list) and stay our marks.
+    int signoffs = 0;
+    for (int i = 0; i < FPDFPage_GetAnnotCount(p2); i++) {
+        FPDF_ANNOTATION a = FPDFPage_GetAnnot(p2, i);
+        unsigned short sub[64] = {};
+        FPDFAnnot_GetStringValue(a, "Subj", sub, sizeof(sub));
+        std::u16string subj((char16_t*)sub);
+        if (subj == u"Prepared by" || subj == u"Reviewed by") { signoffs++; CHECK(marks::IsMark(a)); }
+        FPDFPage_CloseAnnot(a);
+    }
+    CHECK(signoffs == 2);
     int W = 612, H = 792;
     FPDF_BITMAP bm = FPDFBitmap_Create(W, H, 0);
     FPDFBitmap_FillRect(bm, 0, 0, W, H, 0xFFFFFFFF);
@@ -75,6 +95,12 @@ int main(int argc, char** argv) {
         for (int x = 400; x < 420; x++) { unsigned char* q = px + y * st + x * 4; if (q[2] > 180 && q[1] < 80) red++; }
     printf("red pixels at moved mark: %d\n", red);
     CHECK(red > 10);
+    // The Prepared by stamp is drawn in blue.
+    int blue = 0;
+    for (int y = 792 - 770; y < 792 - 740; y++)
+        for (int x = 420; x < 500; x++) { unsigned char* q = px + y * st + x * 4; if (q[0] > 180 && q[2] < 80) blue++; }
+    printf("blue pixels in Prepared by stamp: %d\n", blue);
+    CHECK(blue > 40);
     FILE* pp = fopen("annots_out.ppm", "wb");
     fprintf(pp, "P6 %d %d 255\n", W, H);
     for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) { unsigned char* q = px + y * st + x * 4; fputc(q[2], pp); fputc(q[1], pp); fputc(q[0], pp); }

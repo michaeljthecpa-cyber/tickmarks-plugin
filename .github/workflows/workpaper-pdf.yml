@@ -93,6 +93,9 @@ jobs:
             Stop-Process -Id $p.Id
             Start-Sleep -Seconds 2
           }
+          # A sign-off name so the Marks pane shows real Prepared by / Reviewed by stamps.
+          New-Item -Path HKCU:\Software\WorkpaperPDF\Marks -Force | Out-Null
+          Set-ItemProperty -Path HKCU:\Software\WorkpaperPDF\Marks -Name SignoffName -Value 'MJ'
           Shot @('--theme', 'light', "`"$PWD\tests\sample-60-pages.pdf`"") 'screenshot.png'
           Shot @('--theme', 'dark', "`"$PWD\tests\sample-60-pages.pdf`"") 'screenshot-dark.png'
           Shot @('--theme', 'light') 'screenshot-start.png'

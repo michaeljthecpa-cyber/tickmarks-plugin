@@ -2,7 +2,7 @@
 
 A fast PDF app for audit workpapers. Opens in a blink, no account, no auto-updates, no background services.
 
-**This is build 7**, with a fresh look: a clean toolbar, rounded tabs, a start screen with your recent
+**This is build 8**, which adds Prepared by and Reviewed by sign-off stamps. Build 7 brought a fresh look: a clean toolbar, rounded tabs, a start screen with your recent
 files, and light and dark themes. It views, searches and prints PDFs, organizes pages, adds tickmarks and
 comments, and edits text.
 
@@ -79,6 +79,10 @@ Open the **Marks** pane on the right with the **Marks** button or F6.
   then click the page. Drag instead of clicking to make it any size. Shortcuts: K symbols, N numbers, L letters.
 - **Numbers and letters count up** by themselves (1, 2, 3 or A, B, C) when Auto-increment is ticked.
   Use − and + to set the next one.
+- **Sign-off stamps:** under **Sign-off**, pick **Prepared by** (P) or **Reviewed by** (R) and click the page.
+  The stamp shows your initials and today's date, e.g. `MJ  11/26/2026`. The first time, the app asks for the
+  name or initials to use; change it any time with **Change** under Sign-off. Stamps use the current colour,
+  can be dragged to any size, and appear in Acrobat's comment list as "Prepared by" or "Reviewed by".
 - **Colour and size:** six colours and Small, Medium or Large. Your choices are remembered.
 - **Highlight (H):** drag across text. **Note:** click to drop a sticky note and type; Ctrl+Enter or click away to finish.
 - **Box, Oval and Pen:** drag to draw.

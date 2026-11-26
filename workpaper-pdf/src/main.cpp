@@ -40,7 +40,7 @@
 #include <uxtheme.h>
 
 #define APP_NAME L"Workpaper PDF"
-#define APP_VERSION L"0.7.0 (build 7)"
+#define APP_VERSION L"0.8.0 (build 8)"
 static const wchar_t* kMainClass = L"WorkpaperPDFMain";
 static const wchar_t* kViewClass = L"WorkpaperPDFView";
 static const wchar_t* kThumbClass = L"WorkpaperPDFThumbs";
@@ -56,7 +56,7 @@ enum {
     ID_ABOUT, ID_SHORTCUTS, ID_SAVE, ID_SAVEAS, ID_UNDO, ID_REDO, ID_ROTR, ID_ROTL, ID_DUP, ID_DEL,
     ID_INSERTFILE, ID_INSERTBLANK, ID_EXTRACT, ID_SELECTALL, ID_MARKSPANE, ID_TOOL_HAND, ID_TOOL_SELECT,
     ID_TOOL_TICK, ID_TOOL_NUMBER, ID_TOOL_LETTER, ID_TOOL_HIGHLIGHT, ID_TOOL_NOTE, ID_TOOL_BOX, ID_TOOL_OVAL, ID_TOOL_PEN, ID_TOOL_ADDTEXT, ID_TOOL_EDITTEXT,
-    ID_AUTOINC, ID_DELANNOT, ID_FIND, ID_FINDNEXT, ID_FINDPREV, ID_PRINT, ID_PRINTCLEAN, ID_SIDE_PAGES, ID_SIDE_OUTLINE, ID_SIDE_COMMENTS, ID_GUIDE, ID_DEFAULTAPP, ID_EDITLINE, ID_EDITPARA, ID_MENU, ID_THEME_SYS, ID_THEME_LIGHT, ID_THEME_DARK, ID_ZOOMMENU, ID_ZOOMPRESET,
+    ID_AUTOINC, ID_DELANNOT, ID_FIND, ID_FINDNEXT, ID_FINDPREV, ID_PRINT, ID_PRINTCLEAN, ID_SIDE_PAGES, ID_SIDE_OUTLINE, ID_SIDE_COMMENTS, ID_GUIDE, ID_DEFAULTAPP, ID_EDITLINE, ID_EDITPARA, ID_MENU, ID_THEME_SYS, ID_THEME_LIGHT, ID_THEME_DARK, ID_ZOOMMENU, ID_TOOL_PREPARED, ID_TOOL_REVIEWED, ID_SIGNNAME, ID_ZOOMPRESET,
     ID_ZOOMPRESET_LAST = ID_ZOOMPRESET + 20, ID_PAGEEDIT = 300, ID_TABS = 301, ID_STATUS = 302, ID_FINDEDIT = 303, ID_NAVLIST = 304,
 };
 #define WM_APP_RENDER (WM_APP + 1)
@@ -1157,7 +1157,7 @@ static void LoadMarkSettings() {
     g_ms.textFamily = std::clamp(g_ms.textFamily, 0, 2);
     g_ms.textSize = std::clamp(g_ms.textSize, 6, 36);
     if (RegGetDword(nullptr, L"MarksPane", v)) g_showMarks = v != 0;
-    g_ms.kind = std::clamp(g_ms.kind, 0, 2);
+    g_ms.kind = std::clamp(g_ms.kind, 0, 4);
     g_ms.symbol = std::clamp(g_ms.symbol, 0, marks::SymbolCount() - 1);
     g_ms.color = std::clamp(g_ms.color, 0, marks::ColorCount() - 1);
     g_ms.size = std::clamp(g_ms.size, 0, 2);
@@ -1261,7 +1261,10 @@ static void SetTool(int tool) {
         L"Edit text: click a line (or a table cell) to retype it. Switch to Paragraph in the Marks pane to retype a whole paragraph. Enter to finish, Esc to cancel.",
     };
     g_g.hoverOn = false;
-    if (Cur()) SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)(std::wstring(L"  ") + hints[tool]).c_str());
+    std::wstring hint = hints[tool];
+    if (tool == kTick && (g_ms.kind == marks::kPrepared || g_ms.kind == marks::kReviewed))
+        hint = L"Sign-off: click the page to place the stamp with your name and today's date. Esc returns to the hand.";
+    if (Cur()) SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)(L"  " + hint).c_str());
 }
 
 static void ScrollTo(Tab* t, int x, int y);
@@ -1302,7 +1305,125 @@ static bool AddAnnotation(Tab* t, int page, const std::string& nm, std::function
     return true;
 }
 
+// ---- sign-off stamps (Prepared by / Reviewed by)
+
+static bool IsSignoff(int kind) { return kind == marks::kPrepared || kind == marks::kReviewed; }
+
+// The name or initials printed on sign-off stamps, set once and kept in the registry.
+static std::wstring SignName() {
+    wchar_t buf[128] = {};
+    DWORD sz = sizeof(buf);
+    std::wstring key = std::wstring(kRegKey) + L"\\Marks";
+    if (RegGetValueW(HKEY_CURRENT_USER, key.c_str(), L"SignoffName", RRF_RT_REG_SZ, nullptr, buf, &sz) != 0) return L"";
+    return buf;
+}
+static void SetSignName(const std::wstring& name) {
+    HKEY k;
+    std::wstring key = std::wstring(kRegKey) + L"\\Marks";
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) == 0) {
+        RegSetValueExW(k, L"SignoffName", 0, REG_SZ, (const BYTE*)name.c_str(), (DWORD)((name.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(k);
+    }
+}
+
+// Today's date in the short format set in Windows (e.g. 11/26/2026).
+static std::wstring TodayText() {
+    wchar_t buf[64] = {};
+    if (!GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, nullptr, nullptr, buf, 64, nullptr)) return L"";
+    return buf;
+}
+
+// Stamp text uses the PDF standard font, which covers Latin-1; anything else becomes '?'.
+static std::string Latin1(const std::wstring& w) {
+    std::string out;
+    for (wchar_t c : w) out += (c > 0 && c < 256) ? (char)c : '?';
+    return out;
+}
+
+// A small "Your name or initials" box. Returns false if cancelled.
+static INT_PTR CALLBACK SignNameDlgProc(HWND d, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_INITDIALOG: {
+        std::wstring* name = (std::wstring*)l;
+        SetWindowLongPtrW(d, DWLP_USER, (LONG_PTR)name);
+        SetDlgItemTextW(d, 100, name->c_str());
+        SendDlgItemMessageW(d, 100, EM_SETLIMITTEXT, 24, 0);
+        SendDlgItemMessageW(d, 100, EM_SETSEL, 0, -1);
+        RECT r, pr;
+        GetWindowRect(d, &r);
+        GetWindowRect(g_main, &pr);
+        SetWindowPos(d, nullptr, (pr.left + pr.right - (r.right - r.left)) / 2, (pr.top + pr.bottom - (r.bottom - r.top)) / 3, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER);
+        SetFocus(GetDlgItem(d, 100));
+        return FALSE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(w) == IDOK) {
+            wchar_t buf[64] = {};
+            GetDlgItemTextW(d, 100, buf, 64);
+            std::wstring v = buf;
+            while (!v.empty() && v.back() == L' ') v.pop_back();
+            while (!v.empty() && v.front() == L' ') v.erase(v.begin());
+            if (v.empty()) { MessageBeep(MB_ICONWARNING); return TRUE; }
+            *(std::wstring*)GetWindowLongPtrW(d, DWLP_USER) = v;
+            EndDialog(d, IDOK);
+            return TRUE;
+        }
+        if (LOWORD(w) == IDCANCEL) { EndDialog(d, IDCANCEL); return TRUE; }
+        break;
+    }
+    return FALSE;
+}
+
+static bool AskSignName() {
+    // An in-memory dialog template: prompt, edit box, OK and Cancel.
+    std::vector<WORD> t;
+    auto align = [&] { if (t.size() % 2) t.push_back(0); };
+    auto str = [&](const wchar_t* s) { for (; *s; s++) t.push_back(*s); t.push_back(0); };
+    auto dword = [&](DWORD v) { t.push_back(LOWORD(v)); t.push_back(HIWORD(v)); };
+    dword(DS_MODALFRAME | DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU);
+    dword(0);
+    t.push_back(4);  // items
+    t.push_back(0); t.push_back(0); t.push_back(220); t.push_back(84);
+    t.push_back(0); t.push_back(0);  // no menu, default class
+    str(L"Sign-off name");
+    t.push_back(9);
+    str(L"Segoe UI");
+    auto item = [&](DWORD style, short x, short y, short cx, short cy, WORD id, WORD cls, const wchar_t* text) {
+        align();
+        dword(style | WS_CHILD | WS_VISIBLE);
+        dword(0);
+        t.push_back(x); t.push_back(y); t.push_back(cx); t.push_back(cy); t.push_back(id);
+        t.push_back(0xFFFF); t.push_back(cls);
+        str(text);
+        t.push_back(0);
+    };
+    item(SS_LEFT, 10, 8, 200, 20, 101, 0x0082,
+         L"Your name or initials, as it should appear on Prepared by and Reviewed by stamps:");
+    item(WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 10, 32, 200, 14, 100, 0x0081, L"");
+    item(BS_DEFPUSHBUTTON | WS_TABSTOP, 104, 60, 50, 16, IDOK, 0x0080, L"OK");
+    item(BS_PUSHBUTTON | WS_TABSTOP, 160, 60, 50, 16, IDCANCEL, 0x0080, L"Cancel");
+    std::wstring name = SignName();
+    if (name.empty()) {
+        // Suggest initials from the Windows user name ("michael.jones" -> "MJ").
+        std::wstring u = ToW(Author()), ini;
+        bool start = true;
+        for (wchar_t c : u) {
+            if (iswalpha(c) && start) ini += (wchar_t)towupper(c);
+            start = !iswalnum(c);
+        }
+        name = ini.size() >= 2 ? ini : u;
+    }
+    if (DialogBoxIndirectParamW(g_inst, (LPCDLGTEMPLATEW)t.data(), g_main, SignNameDlgProc, (LPARAM)&name) != IDOK) return false;
+    SetSignName(name);
+    InvalidateRect(g_marks, nullptr, FALSE);
+    return true;
+}
+
+static std::string SignoffText() { return Latin1(SignName()) + "  " + Latin1(TodayText()); }
+
 static std::string CurrentMarkText() {
+    if (IsSignoff(g_ms.kind)) return SignoffText();
     if (g_ms.kind == marks::kNumber) return marks::NumberText(g_ms.nextNumber);
     if (g_ms.kind == marks::kLetter) return marks::LetterText(g_ms.nextLetter);
     return "";
@@ -1321,6 +1442,7 @@ static void PlaceMark(Tab* t, int page, POINT a, POINT b, bool dragged) {
     if (!p) return;
     int rot = FPDFPage_GetRotation(p);
     marks::Kind kind = (marks::Kind)g_ms.kind;
+    if (IsSignoff(kind) && SignName().empty() && !AskSignName()) { FPDF_ClosePage(p); return; }
     std::string text = CurrentMarkText();
     double l, bo, r, tp;
     if (dragged) {
@@ -1331,7 +1453,9 @@ static void PlaceMark(Tab* t, int page, POINT a, POINT b, bool dragged) {
     } else {
         double w, h, cx, cy;
         marks::BaseSize(kind, g_ms.symbol, text, w, h);
-        double sc = marks::SizeScale(g_ms.size);
+        // Sign-offs stay readable at every size: Small is 80%, Large 130%.
+        static const double kSignScale[3] = {0.8, 1.0, 1.3};
+        double sc = IsSignoff(kind) ? kSignScale[std::clamp(g_ms.size, 0, 2)] : marks::SizeScale(g_ms.size);
         w *= sc; h *= sc;
         if (rot % 2) std::swap(w, h);
         ToPage(t, p, page, a, cx, cy);
@@ -1348,7 +1472,7 @@ static void PlaceMark(Tab* t, int page, POINT a, POINT b, bool dragged) {
         FPDF_ClosePage(pg);
         return ok;
     };
-    if (AddAnnotation(t, page, nm, make) && kind != marks::kSymbol) AdvanceCounter();
+    if (AddAnnotation(t, page, nm, make) && (kind == marks::kNumber || kind == marks::kLetter)) AdvanceCounter();
 }
 
 static void ColorOf(int c, uint8_t& r, uint8_t& g, uint8_t& b) { marks::ColorRgb(c, r, g, b); }
@@ -2216,6 +2340,36 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
     }
     y += S(8);
 
+    heading(L"Sign-off");
+    {
+        // Two stamp tiles showing exactly what will be placed, then who is signing.
+        int gap = S(4), bw = (width - gap) / 2, bh = S(44);
+        std::string txt = SignName().empty() ? std::string("Your initials") : SignoffText();
+        for (int i = 0; i < 2; i++) {
+            marks::Kind k = i ? marks::kReviewed : marks::kPrepared;
+            RECT r = {x0 + i * (bw + gap), y, x0 + i * (bw + gap) + bw, y + bh};
+            bool on = g_ms.tool == kTick && g_ms.kind == k;
+            bool hot = hit(r, 18, k, i ? L"Reviewed by stamp (R): click the page to sign off as reviewer"
+                                       : L"Prepared by stamp (P): click the page to sign off as preparer");
+            PaneButton(hdc, r, on, hot);
+            HBITMAP icon = RenderMarkIcon(k, 0, txt, g_ms.color, S(30));
+            DrawBitmapCentered(hdc, icon, r);
+            if (icon) DeleteObject(icon);
+        }
+        y += bh + S(6);
+        std::wstring who = SignName();
+        RECT lr = {x0 + S(2), y, x0 + width - S(70), y + S(26)};
+        SelectObject(hdc, g_smallFont);
+        SetTextColor(hdc, g_c.text2);
+        std::wstring line = who.empty() ? std::wstring(L"Name not set yet") : L"Signing as " + who;
+        DrawTextW(hdc, line.c_str(), -1, &lr, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        RECT cr = {x0 + width - S(64), y, x0 + width, y + S(26)};
+        bool hc = hit(cr, 19, 0, L"Change the name or initials on sign-off stamps");
+        PaneButton(hdc, cr, false, hc);
+        label(cr, who.empty() ? L"Set" : L"Change", g_c.text);
+        y += S(26) + S(12);
+    }
+
     heading(L"Colour");
     {
         int n = marks::ColorCount(), gap = S(6), bw = (width - gap * (n - 1)) / n;
@@ -2299,7 +2453,7 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
     SetTextColor(hdc, g_c.muted);
     DrawTextW(hdc,
               L"Click a mark, then click the page. Drag to size it.\n\n"
-              L"Keys on the page: K tickmark, N number, L letter, H highlight, T add text, E edit text, S select, Esc hand. "
+              L"Keys on the page: K tickmark, N number, L letter, P prepared by, R reviewed by, H highlight, T add text, E edit text, S select, Esc hand. "
               L"Ctrl+Z undoes.",
               -1, &hr, DT_LEFT | DT_WORDBREAK);
 }
@@ -2323,6 +2477,8 @@ static void PaneAction(const PaneHit& h) {
     case 15: g_ms.textSize = std::max(6, g_ms.textSize - (g_ms.textSize > 12 ? 2 : 1)); break;
     case 16: g_ms.textSize = std::min(36, g_ms.textSize + (g_ms.textSize >= 12 ? 2 : 1)); break;
     case 17: g_ms.editPara = h.arg; g_g.hoverAt = POINT{-1000, -1000}; SetTool(kEditText); break;
+    case 18: g_ms.kind = h.arg; SetTool(kTick); if (SignName().empty()) AskSignName(); break;
+    case 19: AskSignName(); break;
     }
     SaveMarkSettings();
     InvalidateRect(g_marks, nullptr, FALSE);
@@ -2735,6 +2891,8 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case 'K': if (!ctrl) { g_ms.kind = marks::kSymbol; SetTool(kTick); return 0; } break;
         case 'N': if (!ctrl) { g_ms.kind = marks::kNumber; SetTool(kTick); return 0; } break;
         case 'L': if (!ctrl) { g_ms.kind = marks::kLetter; SetTool(kTick); return 0; } break;
+        case 'P': if (!ctrl) { g_ms.kind = marks::kPrepared; SetTool(kTick); if (SignName().empty()) AskSignName(); return 0; } break;
+        case 'R': if (!ctrl) { g_ms.kind = marks::kReviewed; SetTool(kTick); if (SignName().empty()) AskSignName(); return 0; } break;
         case 'H': if (!ctrl) { SetTool(kHighlight); return 0; } break;
         case 'S': if (!ctrl) { SetTool(kSelect); return 0; } break;
         case 'T': if (!ctrl) { SetTool(kAddText); return 0; } break;
@@ -3962,6 +4120,7 @@ static void ShowShortcuts() {
                 L"Side pane\tF4\n"
                 L"Marks pane\tF6\n"
                 L"Tickmark / number / letter\tK / N / L\n"
+                L"Prepared by / reviewed by stamp\tP / R\n"
                 L"Highlight / select / hand\tH / S / Esc\n"
                 L"Add text / edit text\tT / E\n"
                 L"Search / next / previous\tCtrl+F / F3 / Shift+F3\n"
@@ -4155,6 +4314,12 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_TOOL_TICK: g_ms.kind = marks::kSymbol; SetTool(kTick); break;
         case ID_TOOL_NUMBER: g_ms.kind = marks::kNumber; SetTool(kTick); break;
         case ID_TOOL_LETTER: g_ms.kind = marks::kLetter; SetTool(kTick); break;
+        case ID_TOOL_PREPARED: case ID_TOOL_REVIEWED:
+            g_ms.kind = LOWORD(w) == ID_TOOL_PREPARED ? marks::kPrepared : marks::kReviewed;
+            SetTool(kTick);
+            if (SignName().empty()) AskSignName();
+            break;
+        case ID_SIGNNAME: AskSignName(); break;
         case ID_TOOL_HIGHLIGHT: SetTool(kHighlight); break;
         case ID_TOOL_NOTE: SetTool(kNote); break;
         case ID_TOOL_BOX: SetTool(kBox); break;
@@ -4262,6 +4427,10 @@ static HMENU BuildMenu() {
     AppendMenuW(tools, MF_STRING, ID_TOOL_NUMBER, L"&Number\tN");
     AppendMenuW(tools, MF_STRING, ID_TOOL_LETTER, L"&Letter\tL");
     AppendMenuW(tools, MF_STRING, ID_AUTOINC, L"&Auto-increment");
+    AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(tools, MF_STRING, ID_TOOL_PREPARED, L"P&repared by stamp\tP");
+    AppendMenuW(tools, MF_STRING, ID_TOOL_REVIEWED, L"Re&viewed by stamp\tR");
+    AppendMenuW(tools, MF_STRING, ID_SIGNNAME, L"Sign-off &name...");
     AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(tools, MF_STRING, ID_TOOL_HIGHLIGHT, L"High&light\tH");
     AppendMenuW(tools, MF_STRING, ID_TOOL_NOTE, L"N&ote");
