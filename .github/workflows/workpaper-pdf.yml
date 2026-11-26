@@ -1,0 +1,90 @@
+name: Build Workpaper PDF
+on:
+  push:
+    paths: ["workpaper-pdf/**", ".github/workflows/workpaper-pdf.yml"]
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  PDFIUM_TAG: chromium/8179
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: workpaper-pdf
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get PDFium
+        shell: pwsh
+        run: |
+          $tag = [uri]::EscapeDataString($env:PDFIUM_TAG)
+          Invoke-WebRequest "https://github.com/bblanchon/pdfium-binaries/releases/download/$tag/pdfium-win-x64.tgz" -OutFile pdfium.tgz
+          New-Item -ItemType Directory -Force third_party\pdfium | Out-Null
+          tar -xzf pdfium.tgz -C third_party\pdfium
+          $notices = "Workpaper PDF includes PDFium ($env:PDFIUM_TAG).`r`n`r`n" + (Get-Content third_party\pdfium\LICENSE -Raw)
+          Get-ChildItem third_party\pdfium\licenses -File | ForEach-Object { $notices += "`r`n`r`n==== $($_.Name) ====`r`n" + (Get-Content $_.FullName -Raw) }
+          Set-Content THIRD-PARTY-NOTICES.txt $notices
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          cmake --build build --config Release --parallel
+
+      - name: Speed check
+        shell: pwsh
+        run: |
+          $p = Start-Process build\Release\WorkpaperPDF.exe -ArgumentList '--benchmark', "$PWD\tests\sample-60-pages.pdf", "$PWD\speed.txt" -Wait -PassThru
+          Get-Content speed.txt
+          if ($p.ExitCode -ne 0) { throw "benchmark failed" }
+          "## Speed check (60-page sample)" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          Get-Content speed.txt | ForEach-Object { "- $_" } | Out-File -Append $env:GITHUB_STEP_SUMMARY
+
+      - name: Screenshot check
+        shell: pwsh
+        run: |
+          $p = Start-Process build\Release\WorkpaperPDF.exe -ArgumentList "`"$PWD\tests\sample-60-pages.pdf`"" -PassThru
+          Start-Sleep -Seconds 6
+          if ($p.HasExited) { throw "the app closed by itself (exit code $($p.ExitCode))" }
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $bmp.Save("$PWD\dist\screenshot.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          Stop-Process -Id $p.Id
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist\WorkpaperPDF | Out-Null
+          Copy-Item build\Release\WorkpaperPDF.exe, build\Release\pdfium.dll, THIRD-PARTY-NOTICES.txt dist\WorkpaperPDF\
+          Copy-Item README.md dist\WorkpaperPDF\README.txt
+          Compress-Archive -Path dist\WorkpaperPDF\* -DestinationPath dist\WorkpaperPDF-portable.zip -Force
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc /Qp "/DSourceDir=..\build\Release" installer\WorkpaperPDF.iss
+          if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WorkpaperPDF
+          path: |
+            workpaper-pdf/dist/WorkpaperPDF-Setup.exe
+            workpaper-pdf/dist/WorkpaperPDF-portable.zip
+            workpaper-pdf/dist/screenshot.png
+            workpaper-pdf/speed.txt
+
+      - name: Publish download
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "workpaper-pdf-latest"
+          gh release delete $tag --yes --cleanup-tag 2>$null
+          $notes = "Latest build of Workpaper PDF from branch $env:GITHUB_REF_NAME ($env:GITHUB_SHA).`n`nSpeed check:`n" + ((Get-Content speed.txt) -join "`n")
+          gh release create $tag dist\WorkpaperPDF-Setup.exe dist\WorkpaperPDF-portable.zip dist\screenshot.png speed.txt --title "Workpaper PDF (latest build)" --notes $notes --target $env:GITHUB_SHA --prerelease

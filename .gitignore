@@ -2,3 +2,6 @@ out/
 obj/
 package/
 *.user
+workpaper-pdf/build/
+workpaper-pdf/third_party/
+workpaper-pdf/dist/
