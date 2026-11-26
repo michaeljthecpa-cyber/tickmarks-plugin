@@ -2,7 +2,7 @@
 
 A fast PDF app for audit workpapers. Opens in a blink, no account, no auto-updates, no background services.
 
-**This is build 3.** It views PDFs, organizes pages, and adds tickmarks and comments. Text editing arrives in the next builds.
+**This is build 4.** It views PDFs, organizes pages, adds tickmarks and comments, and edits text.
 
 ## Install
 
@@ -61,6 +61,20 @@ Open the **Marks** pane on the right with the **Marks** button or F6.
   Double-click a note to edit it. Esc goes back to the hand tool.
 - Marks are standard PDF annotations, so they show and print the same in Acrobat and any other PDF reader.
 - Ctrl+Z undoes marks too. Save (Ctrl+S) to keep them.
+
+## Editing text
+
+- **Add text (T):** click where the text should start and type. Enter starts a new line. Click away or press
+  Ctrl+Enter to finish, Esc to cancel. Pick Sans, Serif or Mono, bold and the size under **New text** in the Marks pane;
+  the colour comes from the colour swatches.
+- **Edit text (E):** point at any line and a dotted box shows what will change. Click it, retype, press Enter.
+  In tables, each cell is its own piece, so you can change one amount without touching the row.
+  Clear the box and press Enter to delete the text.
+- Where possible the change is made in the PDF itself, in the original font. When that can't be done
+  (some fonts only carry the letters already used), the old text is covered with white and retyped in the
+  closest standard font, sized to match. Either way, Ctrl+Z undoes it.
+- Text in a scanned page is a picture, not real text, so it can't be retyped. Use Add text to write the correction next to it.
+- Editing a whole paragraph so the lines re-flow is coming in a later build.
 
 ## Uninstall
 

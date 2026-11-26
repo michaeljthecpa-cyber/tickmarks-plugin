@@ -30,11 +30,12 @@
 #include "fpdf_annot.h"
 #include "fpdf_text.h"
 #include "fpdf_edit.h"
+#include "textedit.h"
 #include <functional>
 #include "resource.h"
 
 #define APP_NAME L"Workpaper PDF"
-#define APP_VERSION L"0.3.0 (build 3)"
+#define APP_VERSION L"0.4.0 (build 4)"
 static const wchar_t* kMainClass = L"WorkpaperPDFMain";
 static const wchar_t* kViewClass = L"WorkpaperPDFView";
 static const wchar_t* kThumbClass = L"WorkpaperPDFThumbs";
@@ -46,7 +47,7 @@ enum {
     ID_THUMBS, ID_GOTO, ID_NEXTTAB, ID_PREVTAB, ID_PREVPAGE, ID_NEXTPAGE, ID_FIRSTPAGE, ID_LASTPAGE,
     ID_ABOUT, ID_SHORTCUTS, ID_SAVE, ID_SAVEAS, ID_UNDO, ID_REDO, ID_ROTR, ID_ROTL, ID_DUP, ID_DEL,
     ID_INSERTFILE, ID_INSERTBLANK, ID_EXTRACT, ID_SELECTALL, ID_MARKSPANE, ID_TOOL_HAND, ID_TOOL_SELECT,
-    ID_TOOL_TICK, ID_TOOL_NUMBER, ID_TOOL_LETTER, ID_TOOL_HIGHLIGHT, ID_TOOL_NOTE, ID_TOOL_BOX, ID_TOOL_OVAL, ID_TOOL_PEN,
+    ID_TOOL_TICK, ID_TOOL_NUMBER, ID_TOOL_LETTER, ID_TOOL_HIGHLIGHT, ID_TOOL_NOTE, ID_TOOL_BOX, ID_TOOL_OVAL, ID_TOOL_PEN, ID_TOOL_ADDTEXT, ID_TOOL_EDITTEXT,
     ID_AUTOINC, ID_DELANNOT, ID_PAGEEDIT = 300, ID_TABS = 301, ID_STATUS = 302,
 };
 #define WM_APP_RENDER (WM_APP + 1)
@@ -703,6 +704,7 @@ static void InsertFileDialog(Tab* t) {
 }
 
 static void CommitNote();
+static void CommitText(bool cancel);
 static void ClearSelection();
 static void CloseTab(int i) {
     if (i < 0 || i >= (int)g_docs.size()) return;
@@ -775,8 +777,8 @@ static void ZoomStep(Tab* t, int dir, POINT* anchor) {
 
 // ---------------------------------------------------------------- marking tools
 
-enum Tool { kHand = 0, kSelect, kTick, kHighlight, kNote, kBox, kOval, kPen, kToolCount };
-static const wchar_t* kToolNames[kToolCount] = {L"Hand", L"Select", L"Tickmark", L"Highlight", L"Note", L"Box", L"Oval", L"Pen"};
+enum Tool { kHand = 0, kSelect, kTick, kHighlight, kNote, kBox, kOval, kPen, kAddText, kEditText, kToolCount };
+static const wchar_t* kToolNames[kToolCount] = {L"Hand", L"Select", L"Tickmark", L"Highlight", L"Note", L"Box", L"Oval", L"Pen", L"Add text", L"Edit text"};
 
 struct MarkSettings {
     int tool = kHand;
@@ -788,6 +790,9 @@ struct MarkSettings {
     int wrap = 0;
     int nextNumber = 1;  // 1..40
     int nextLetter = 0;  // 0..25
+    int textFamily = 0;  // Add text: 0 sans, 1 serif, 2 mono
+    int textBold = 0;
+    int textSize = 10;   // points
 };
 static MarkSettings g_ms;
 static HWND g_marks;  // the Marks pane on the right
@@ -798,8 +803,11 @@ static void LoadMarkSettings() {
     DWORD v;
     struct { const wchar_t* name; int* p; } f[] = {{L"Kind", &g_ms.kind}, {L"Symbol", &g_ms.symbol}, {L"Color", &g_ms.color},
         {L"Size", &g_ms.size}, {L"AutoIncrement", &g_ms.autoInc}, {L"Wrap", &g_ms.wrap}, {L"NextNumber", &g_ms.nextNumber},
-        {L"NextLetter", &g_ms.nextLetter}};
+        {L"NextLetter", &g_ms.nextLetter}, {L"TextFamily", &g_ms.textFamily}, {L"TextBold", &g_ms.textBold},
+        {L"TextSize", &g_ms.textSize}};
     for (auto& x : f) if (RegGetDword(L"Marks", x.name, v)) *x.p = (int)v;
+    g_ms.textFamily = std::clamp(g_ms.textFamily, 0, 2);
+    g_ms.textSize = std::clamp(g_ms.textSize, 6, 36);
     if (RegGetDword(nullptr, L"MarksPane", v)) g_showMarks = v != 0;
     g_ms.kind = std::clamp(g_ms.kind, 0, 2);
     g_ms.symbol = std::clamp(g_ms.symbol, 0, marks::SymbolCount() - 1);
@@ -811,7 +819,8 @@ static void LoadMarkSettings() {
 static void SaveMarkSettings() {
     struct { const wchar_t* name; int v; } f[] = {{L"Kind", g_ms.kind}, {L"Symbol", g_ms.symbol}, {L"Color", g_ms.color},
         {L"Size", g_ms.size}, {L"AutoIncrement", g_ms.autoInc}, {L"Wrap", g_ms.wrap}, {L"NextNumber", g_ms.nextNumber},
-        {L"NextLetter", g_ms.nextLetter}};
+        {L"NextLetter", g_ms.nextLetter}, {L"TextFamily", g_ms.textFamily}, {L"TextBold", g_ms.textBold},
+        {L"TextSize", g_ms.textSize}};
     for (auto& x : f) RegSetDword(L"Marks", x.name, (DWORD)x.v);
     RegSetDword(nullptr, L"MarksPane", g_showMarks ? 1 : 0);
 }
@@ -875,6 +884,10 @@ static struct {
     int selSubtype = 0;
     annots::Rect selRect{};
     bool moving = false, resizing = false, snapTaken = false;
+    // Edit text tool: the run of text under the mouse
+    RECT hover{};
+    bool hoverOn = false;
+    POINT hoverAt{-1000, -1000};
 } g_g;
 
 static void ClearSelection() {
@@ -896,7 +909,10 @@ static void SetTool(int tool) {
         L"Box: drag to draw a box.",
         L"Oval: drag to draw an oval, for example around an amount.",
         L"Pen: draw freehand. Each stroke is saved as you go.",
+        L"Add text: click where the text should start, then type. Enter starts a new line; click away or Ctrl+Enter to finish.",
+        L"Edit text: click a line (or a table cell) to retype it. Enter to finish, Esc to cancel. Empty it to delete the text.",
     };
+    g_g.hoverOn = false;
     if (Cur()) SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)(std::wstring(L"  ") + hints[tool]).c_str());
 }
 
@@ -1072,6 +1088,200 @@ static void FinishPen(Tab* t) {
     });
 }
 
+// ---- text editor: a box over the page for adding new text or retyping a run of existing text
+
+static HWND g_textEdit;
+static HFONT g_textFont;
+static HBRUSH g_whiteBrush;
+static struct {
+    Tab* tab = nullptr;
+    int page = -1;
+    bool replace = false;     // retyping existing text (else adding new text)
+    textedit::Line line;      // the run being retyped
+    std::wstring before;
+    COLORREF color = 0;
+    int ascent = 0;           // pixels from the box top to the first baseline
+    int minW = 0, lineH = 0;
+} g_te;
+
+static void FitTextEditor() {
+    if (!g_textEdit) return;
+    int len = GetWindowTextLengthW(g_textEdit);
+    std::wstring text(len, L'\0');
+    GetWindowTextW(g_textEdit, &text[0], len + 1);
+    HDC dc = GetDC(g_textEdit);
+    HGDIOBJ of = SelectObject(dc, g_textFont);
+    RECT r = {0, 0, 0, 0};
+    std::wstring measure = text.empty() ? L"M" : text;
+    if (!measure.empty() && measure.back() == L'\n') measure += L"M";
+    DrawTextW(dc, measure.c_str(), -1, &r, DT_CALCRECT | DT_NOPREFIX | DT_EXPANDTABS);
+    SelectObject(dc, of);
+    ReleaseDC(g_textEdit, dc);
+    RECT wr;
+    GetWindowRect(g_textEdit, &wr);
+    MapWindowPoints(nullptr, g_view, (POINT*)&wr, 2);
+    int w = std::max<int>(g_te.minW, r.right + g_te.lineH);
+    int h = std::max<int>(g_te.lineH, r.bottom) + S(4);
+    SetWindowPos(g_textEdit, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static bool TabAlive(Tab* t) {
+    for (auto& d : g_docs) if (d.get() == t) return true;
+    return false;
+}
+
+static void CommitText(bool cancel) {
+    if (!g_textEdit || g_te.page < 0) return;
+    int page = g_te.page;
+    g_te.page = -1;
+    Tab* t = g_te.tab;
+    int len = GetWindowTextLengthW(g_textEdit);
+    std::wstring text(len, L'\0');
+    GetWindowTextW(g_textEdit, &text[0], len + 1);
+    RECT wr;
+    GetWindowRect(g_textEdit, &wr);
+    MapWindowPoints(nullptr, g_view, (POINT*)&wr, 2);
+    ShowWindow(g_textEdit, SW_HIDE);
+    InvalidateRect(g_view, nullptr, FALSE);
+    if (cancel || !TabAlive(t) || page >= t->pdf.PageCount()) return;
+    std::wstring clean;
+    for (wchar_t c : text) if (c != L'\r') clean.push_back(c);
+    if (g_te.replace ? clean == g_te.before : clean.find_first_not_of(L" \n\t") == std::wstring::npos) return;
+    if (!Checkpoint(t)) return;
+    FPDF_PAGE p = FPDF_LoadPage(t->pdf.Handle(), page);
+    if (!p) return;
+    std::u16string u = ToU16(clean);
+    if (g_te.replace) {
+        textedit::Result r = textedit::ReplaceLine(t->pdf.Handle(), p, g_te.line, u);
+        FPDF_ClosePage(p);
+        if (r == textedit::kFailed) {
+            t->undo.pop_back();
+            MessageBoxW(g_main, L"This text could not be changed. It may be part of an image (a scan) rather than real text.",
+                        APP_NAME, MB_ICONINFORMATION);
+            return;
+        }
+        SendMessageW(g_status, SB_SETTEXTW, 0,
+                     (LPARAM)(r == textedit::kReplaced ? L"  Text changed."
+                                                      : L"  Text changed. The old text is covered with white and retyped on top."));
+    } else {
+        // The first baseline sits `ascent` pixels below the box top; the box's left edge is where the text starts.
+        POINT base = {wr.left + S(2), wr.top + S(1) + g_te.ascent};
+        double x, y;
+        ToPage(t, p, page, base, x, y);
+        int rot = FPDFPage_GetRotation(p);
+        bool ok = textedit::AddText(t->pdf.Handle(), p, u, x, y, g_ms.textSize, g_ms.textFamily, g_ms.textBold != 0, false,
+                                    GetRValue(g_te.color), GetGValue(g_te.color), GetBValue(g_te.color), rot);
+        FPDF_ClosePage(p);
+        if (!ok) {
+            t->undo.pop_back();
+            return;
+        }
+    }
+    RefreshPage(t, page);
+}
+
+static HFONT MakeTextFont(int family, bool bold, bool italic, int px) {
+    static const wchar_t* faces[3] = {L"Arial", L"Times New Roman", L"Courier New"};
+    return CreateFontW(-std::max(6, px), 0, 0, 0, bold ? FW_BOLD : FW_NORMAL, italic, 0, 0, DEFAULT_CHARSET, 0, 0,
+                       CLEARTYPE_QUALITY, 0, faces[std::clamp(family, 0, 2)]);
+}
+
+// Shows the editor with its top-left at `at` (view coordinates).
+static void ShowTextEditor(Tab* t, int page, POINT at, int minW, const std::wstring& text, bool multiline) {
+    if (g_textEdit) DestroyWindow(g_textEdit);
+    DWORD style = WS_CHILD | ES_AUTOHSCROLL | (multiline ? ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL : 0);
+    g_textEdit = CreateWindowExW(0, L"EDIT", L"", style, 0, 0, 0, 0, g_view, nullptr, g_inst, nullptr);
+    if (!g_whiteBrush) g_whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
+    SendMessageW(g_textEdit, WM_SETFONT, (WPARAM)g_textFont, FALSE);
+    SendMessageW(g_textEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(2), S(2)));
+    HDC dc = GetDC(g_textEdit);
+    HGDIOBJ of = SelectObject(dc, g_textFont);
+    TEXTMETRICW tm;
+    GetTextMetricsW(dc, &tm);
+    SelectObject(dc, of);
+    ReleaseDC(g_textEdit, dc);
+    g_te.ascent = tm.tmAscent;
+    g_te.lineH = tm.tmHeight;
+    g_te.minW = std::max(minW, S(40));
+    g_te.tab = t;
+    g_te.page = page;
+    g_te.before = text;
+    std::wstring shown;
+    for (wchar_t c : text) { if (c == L'\n') shown += L"\r\n"; else shown.push_back(c); }
+    SetWindowTextW(g_textEdit, shown.c_str());
+    SetWindowPos(g_textEdit, HWND_TOP, at.x, at.y, g_te.minW, g_te.lineH + S(4), SWP_SHOWWINDOW);
+    FitTextEditor();
+    SetFocus(g_textEdit);
+    SendMessageW(g_textEdit, EM_SETSEL, 0, -1);
+}
+
+static void StartAddText(Tab* t, int page, POINT v) {
+    uint8_t r, g, b;
+    marks::ColorRgb(g_ms.color, r, g, b);
+    g_te.color = RGB(r, g, b);
+    g_te.replace = false;
+    if (g_textFont) DeleteObject(g_textFont);
+    g_textFont = MakeTextFont(g_ms.textFamily, g_ms.textBold != 0, false, (int)lround(g_ms.textSize * t->scale));
+    ShowTextEditor(t, page, POINT{v.x - S(2), v.y - S(1)}, S(60), L"", true);
+    SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)L"  Type the text. Enter starts a new line. Click away or press Ctrl+Enter to finish, Esc to cancel.");
+}
+
+// Finds the run of text under a view point.
+static bool RunAt(Tab* t, int page, POINT v, textedit::Line& ln, RECT& view) {
+    FPDF_PAGE p = FPDF_LoadPage(t->pdf.Handle(), page);
+    if (!p) return false;
+    double x, y;
+    ToPage(t, p, page, v, x, y);
+    bool ok = textedit::LineAt(p, x, y, 3 / t->scale + 1, ln);
+    if (ok) view = RectToView(t, p, page, annots::Rect{(float)ln.left, (float)ln.bottom, (float)ln.right, (float)ln.top});
+    FPDF_ClosePage(p);
+    return ok;
+}
+
+static void StartEditText(Tab* t, int page, POINT v) {
+    textedit::Line ln;
+    RECT vr;
+    if (!RunAt(t, page, v, ln, vr)) {
+        SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)L"  There is no text there to edit. If the page is a scan, use Add text instead.");
+        return;
+    }
+    g_te.line = ln;
+    g_te.replace = true;
+    g_te.color = RGB(ln.r, ln.g, ln.b);
+    if (ln.invisible) g_te.color = RGB(0, 0, 0);
+    if (g_textFont) DeleteObject(g_textFont);
+    // Sideways text is retyped in a level box; the page keeps its direction.
+    g_textFont = MakeTextFont(ln.family, ln.bold, ln.italic, (int)lround(ln.size * t->scale));
+    std::wstring text = ToW(ln.text);
+    HDC dc = GetDC(g_view);
+    HGDIOBJ of = SelectObject(dc, g_textFont);
+    TEXTMETRICW tm;
+    GetTextMetricsW(dc, &tm);
+    SelectObject(dc, of);
+    ReleaseDC(g_view, dc);
+    // Line the editor's baseline up with the text's baseline.
+    FPDF_PAGE p = FPDF_LoadPage(t->pdf.Handle(), page);
+    POINT base = p ? ToView(t, p, page, ln.ox, ln.oy) : POINT{vr.left, vr.bottom};
+    int rot = p ? FPDFPage_GetRotation(p) : 0;
+    if (p) FPDF_ClosePage(p);
+    double screenAngle = ln.angle - rot * 1.5707963267948966;  // the page turns clockwise on screen
+    bool level = std::fabs(std::sin(screenAngle)) < 0.01 && std::cos(screenAngle) > 0;
+    POINT at = level ? POINT{base.x - S(2), base.y - S(1) - tm.tmAscent} : POINT{vr.left, vr.top};
+    ShowTextEditor(t, page, at, vr.right - vr.left + S(8), text, false);
+    SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)L"  Retype the text, then press Enter. Esc cancels.");
+}
+
+static void UpdateEditHover(Tab* t, POINT v) {
+    if (abs(v.x - g_g.hoverAt.x) < S(3) && abs(v.y - g_g.hoverAt.y) < S(3)) return;
+    g_g.hoverAt = v;
+    bool was = g_g.hoverOn;
+    RECT old = g_g.hover;
+    int page = PageAt(t, v);
+    textedit::Line ln;
+    g_g.hoverOn = page >= 0 && RunAt(t, page, v, ln, g_g.hover);
+    if (was != g_g.hoverOn || (g_g.hoverOn && !EqualRect(&old, &g_g.hover))) InvalidateRect(g_view, nullptr, FALSE);
+}
+
 // ---- sticky note editor: a small yellow text box over the page
 
 static HWND g_noteEdit;
@@ -1079,6 +1289,7 @@ static struct { int page = -1; std::string nm; std::wstring before; Tab* tab = n
 static HBRUSH g_noteBrush;
 
 static void CommitNote() {
+    CommitText(false);
     if (!g_noteEdit || g_noteEd.page < 0) return;
     Tab* t = g_noteEd.tab;
     int len = GetWindowTextLengthW(g_noteEdit);
@@ -1271,6 +1482,13 @@ static void ToolDown(Tab* t, POINT v, bool dbl) {
     case kNote:
         if (page >= 0) PlaceNote(t, page, v);
         return;
+    case kAddText:
+        if (page >= 0) StartAddText(t, page, v);
+        return;
+    case kEditText:
+        if (page >= 0) StartEditText(t, page, v);
+        g_g.hoverOn = false;
+        return;
     default:
         if (page >= 0) g_g.active = true;
         if (g_ms.tool == kPen) g_g.pen.push_back(v);
@@ -1350,6 +1568,17 @@ static void PaintOverlay(HDC hdc, Tab* t) {
         HGDIOBJ op = SelectObject(hdc, pen);
         Polyline(hdc, g_g.pen.data(), (int)g_g.pen.size());
         SelectObject(hdc, op);
+        DeleteObject(pen);
+    }
+    if (g_ms.tool == kEditText && g_g.hoverOn && !(g_textEdit && IsWindowVisible(g_textEdit))) {
+        RECT r = g_g.hover;
+        InflateRect(&r, S(3), S(2));
+        HPEN pen = CreatePen(PS_DOT, 1, RGB(0x1F, 0x6F, 0xEB));
+        HGDIOBJ op = SelectObject(hdc, pen), ob = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        SetBkMode(hdc, TRANSPARENT);
+        Rectangle(hdc, r.left, r.top, r.right, r.bottom);
+        SelectObject(hdc, op);
+        SelectObject(hdc, ob);
         DeleteObject(pen);
     }
     if (!g_g.selNm.empty() && g_g.selPage >= 0 && g_g.selPage < t->pdf.PageCount()) {
@@ -1484,9 +1713,9 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
 
     heading(L"Tools");
     {
-        int cols = 4, gap = S(4), bw = (width - gap * (cols - 1)) / cols, bh = S(26);
-        int order[] = {kHand, kSelect, kHighlight, kNote, kBox, kOval, kPen};
-        for (int k = 0; k < 7; k++) {
+        int cols = 3, gap = S(4), bw = (width - gap * (cols - 1)) / cols, bh = S(26);
+        int order[] = {kHand, kSelect, kHighlight, kAddText, kEditText, kNote, kBox, kOval, kPen};
+        for (int k = 0; k < 9; k++) {
             RECT r = {x0 + (k % cols) * (bw + gap), y + (k / cols) * (bh + gap), 0, 0};
             r.right = r.left + bw;
             r.bottom = r.top + bh;
@@ -1494,7 +1723,7 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
             PaneButton(hdc, r, g_ms.tool == order[k], hot);
             label(r, kToolNames[order[k]], RGB(0x24, 0x29, 0x33));
         }
-        y += 2 * (bh + gap) + S(8);
+        y += 3 * (bh + gap) + S(8);
     }
 
     heading(L"Tickmarks");
@@ -1591,13 +1820,47 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
         }
         y += S(36);
     }
+    heading(L"New text");
+    {
+        int gap = S(4), bh = S(26);
+        static const wchar_t* fam[3] = {L"Sans", L"Serif", L"Mono"};
+        int bw = (width - 3 * gap - S(30)) / 3;
+        for (int i = 0; i < 3; i++) {
+            RECT r = {x0 + i * (bw + gap), y, x0 + i * (bw + gap) + bw, y + bh};
+            bool hot = hit(r, 13, i, nullptr);
+            PaneButton(hdc, r, g_ms.textFamily == i, hot);
+            label(r, fam[i], RGB(0x24, 0x29, 0x33));
+        }
+        RECT br = {x0 + width - S(30), y, x0 + width, y + bh};
+        bool hb = hit(br, 14, 0, L"Bold");
+        PaneButton(hdc, br, g_ms.textBold != 0, hb);
+        SelectObject(hdc, g_bigFont ? g_bigFont : g_font);
+        SetTextColor(hdc, RGB(0x24, 0x29, 0x33));
+        DrawTextW(hdc, L"B", -1, &br, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        y += bh + S(6);
+        RECT lr = {x0, y, x0 + width - S(60), y + bh};
+        wchar_t sz[32];
+        swprintf(sz, 32, L"Size %d pt", g_ms.textSize);
+        SelectObject(hdc, g_font);
+        SetTextColor(hdc, RGB(0x44, 0x48, 0x50));
+        DrawTextW(hdc, sz, -1, &lr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        RECT minus = {x0 + width - S(58), y + S(2), x0 + width - S(32), y + bh - S(2)};
+        RECT plus = {x0 + width - S(26), y + S(2), x0 + width, y + bh - S(2)};
+        bool hm = hit(minus, 15, 0, L"Smaller");
+        PaneButton(hdc, minus, false, hm);
+        label(minus, L"\x2212", RGB(0x24, 0x29, 0x33));
+        bool hp = hit(plus, 16, 0, L"Larger");
+        PaneButton(hdc, plus, false, hp);
+        label(plus, L"+", RGB(0x24, 0x29, 0x33));
+        y += bh + S(10);
+    }
     // Shortcut reminder.
     RECT hr = {x0, y, x0 + width, rc.bottom - S(6)};
     SelectObject(hdc, g_font);
     SetTextColor(hdc, RGB(0x6B, 0x72, 0x80));
     DrawTextW(hdc,
               L"Click a mark, then click the page. Drag to size it.\n\n"
-              L"Keys on the page: K tickmark, N number, L letter, H highlight, S select, Esc hand. "
+              L"Keys on the page: K tickmark, N number, L letter, H highlight, T add text, E edit text, S select, Esc hand. "
               L"Ctrl+Z undoes.",
               -1, &hr, DT_LEFT | DT_WORDBREAK);
 }
@@ -1616,6 +1879,10 @@ static void PaneAction(const PaneHit& h) {
     case 9: g_ms.nextNumber = std::min(40, g_ms.nextNumber + 1); break;
     case 10: g_ms.nextLetter = std::max(0, g_ms.nextLetter - 1); break;
     case 11: g_ms.nextLetter = std::min(25, g_ms.nextLetter + 1); break;
+    case 13: g_ms.textFamily = h.arg; if (g_ms.tool != kAddText) SetTool(kAddText); break;
+    case 14: g_ms.textBold = !g_ms.textBold; break;
+    case 15: g_ms.textSize = std::max(6, g_ms.textSize - (g_ms.textSize > 12 ? 2 : 1)); break;
+    case 16: g_ms.textSize = std::min(36, g_ms.textSize + (g_ms.textSize >= 12 ? 2 : 1)); break;
     }
     SaveMarkSettings();
     InvalidateRect(g_marks, nullptr, FALSE);
@@ -1783,6 +2050,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_VSCROLL: {
         if (!t) return 0;
+        CommitNote();
         RECT rc = ViewClient();
         SCROLLINFO si = {sizeof(si), SIF_ALL};
         GetScrollInfo(h, SB_VERT, &si);
@@ -1801,6 +2069,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_HSCROLL: {
         if (!t) return 0;
+        CommitNote();
         RECT rc = ViewClient();
         SCROLLINFO si = {sizeof(si), SIF_ALL};
         GetScrollInfo(h, SB_HORZ, &si);
@@ -1817,6 +2086,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_MOUSEWHEEL: {
         if (!t) return 0;
+        CommitNote();
         int delta = GET_WHEEL_DELTA_WPARAM(w);
         if (GET_KEYSTATE_WPARAM(w) & MK_CONTROL) {
             POINT p = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
@@ -1855,6 +2125,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_MOUSEMOVE:
         if (g_dragging && t) ScrollTo(t, g_dragSX - (GET_X_LPARAM(l) - g_dragStart.x), g_dragSY - (GET_Y_LPARAM(l) - g_dragStart.y));
         else if (t && g_g.active) ToolMove(t, POINT{GET_X_LPARAM(l), GET_Y_LPARAM(l)});
+        else if (t && g_ms.tool == kEditText) UpdateEditHover(t, POINT{GET_X_LPARAM(l), GET_Y_LPARAM(l)});
         return 0;
     case WM_LBUTTONUP:
         if (g_dragging) g_dragging = false;
@@ -1867,9 +2138,12 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_CTLCOLOREDIT:
         if ((HWND)l == g_noteEdit) { SetBkColor((HDC)w, RGB(0xFF, 0xF6, 0xB8)); return (LRESULT)g_noteBrush; }
+        if ((HWND)l == g_textEdit) { SetBkColor((HDC)w, RGB(255, 255, 255)); SetTextColor((HDC)w, g_te.color); return (LRESULT)g_whiteBrush; }
         break;
     case WM_COMMAND:
         if ((HWND)l == g_noteEdit && HIWORD(w) == EN_KILLFOCUS) CommitNote();
+        if (g_textEdit && (HWND)l == g_textEdit && HIWORD(w) == EN_KILLFOCUS) CommitText(false);
+        if (g_textEdit && (HWND)l == g_textEdit && HIWORD(w) == EN_CHANGE) FitTextEditor();
         return 0;
     case WM_SETCURSOR:
         if (LOWORD(l) == HTCLIENT && t) {
@@ -1879,7 +2153,7 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             LPCWSTR c = IDC_HAND;
             if (g_dragging) c = IDC_SIZEALL;
             else if (g_ms.tool == kSelect) c = OnResizeHandle(t, v) ? IDC_SIZENWSE : IDC_ARROW;
-            else if (g_ms.tool == kHighlight) c = IDC_IBEAM;
+            else if (g_ms.tool == kHighlight || g_ms.tool == kAddText || g_ms.tool == kEditText) c = PageAt(t, v) >= 0 ? IDC_IBEAM : IDC_HAND;
             else if (g_ms.tool != kHand) c = PageAt(t, v) >= 0 ? IDC_CROSS : IDC_HAND;
             SetCursor(LoadCursor(nullptr, c));
             return TRUE;
@@ -1908,6 +2182,8 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case 'L': if (!ctrl) { g_ms.kind = marks::kLetter; SetTool(kTick); return 0; } break;
         case 'H': if (!ctrl) { SetTool(kHighlight); return 0; } break;
         case 'S': if (!ctrl) { SetTool(kSelect); return 0; } break;
+        case 'T': if (!ctrl) { SetTool(kAddText); return 0; } break;
+        case 'E': if (!ctrl) { SetTool(kEditText); return 0; } break;
         }
         break;
     }
@@ -2642,6 +2918,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_TOOL_BOX: SetTool(kBox); break;
         case ID_TOOL_OVAL: SetTool(kOval); break;
         case ID_TOOL_PEN: SetTool(kPen); break;
+        case ID_TOOL_ADDTEXT: SetTool(kAddText); break;
+        case ID_TOOL_EDITTEXT: SetTool(kEditText); break;
         case ID_AUTOINC: g_ms.autoInc = !g_ms.autoInc; SaveMarkSettings(); InvalidateRect(g_marks, nullptr, FALSE); break;
         case ID_DELANNOT: DeleteSelectedAnnot(t); break;
         case ID_SAVE: CommitNote(); SaveTab(t, false); break;
@@ -2708,6 +2986,9 @@ static HMENU BuildMenu() {
     AppendMenuW(tools, MF_STRING, ID_TOOL_BOX, L"&Box");
     AppendMenuW(tools, MF_STRING, ID_TOOL_OVAL, L"&Oval");
     AppendMenuW(tools, MF_STRING, ID_TOOL_PEN, L"&Pen");
+    AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(tools, MF_STRING, ID_TOOL_ADDTEXT, L"Add te&xt\tT");
+    AppendMenuW(tools, MF_STRING, ID_TOOL_EDITTEXT, L"&Edit text\tE");
     AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(tools, MF_STRING, ID_MARKSPANE, L"Show marks &pane\tF6");
     AppendMenuW(file, MF_STRING, ID_OPEN, L"&Open...\tCtrl+O");
@@ -2928,6 +3209,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
             SetFocus(g_view);
             continue;
         }
+        if (g_textEdit && msg.hwnd == g_textEdit && msg.message == WM_KEYDOWN &&
+            (msg.wParam == VK_ESCAPE || (msg.wParam == VK_RETURN && (g_te.replace || GetKeyState(VK_CONTROL) < 0)))) {
+            CommitText(msg.wParam == VK_ESCAPE);
+            SetFocus(g_view);
+            continue;
+        }
+        if (g_textEdit && msg.hwnd == g_textEdit && IsWindowVisible(g_textEdit)) { TranslateMessage(&msg); DispatchMessageW(&msg); continue; }
         // While typing a note, keys belong to the note (no shortcuts).
         if (g_noteEdit && msg.hwnd == g_noteEdit && IsWindowVisible(g_noteEdit)) { TranslateMessage(&msg); DispatchMessageW(&msg); continue; }
         if (TranslateAcceleratorW(g_main, g_accel, &msg)) continue;

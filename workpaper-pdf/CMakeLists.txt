@@ -6,7 +6,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # PDFium prebuilt binaries (https://github.com/bblanchon/pdfium-binaries), unpacked by the build.
 set(PDFIUM_DIR "${CMAKE_SOURCE_DIR}/third_party/pdfium" CACHE PATH "PDFium binaries")
 
-add_executable(WorkpaperPDF WIN32 src/main.cpp src/pdf.cpp src/pdfops.cpp src/convert.cpp src/marks.cpp src/annots.cpp res/app.rc)
+add_executable(WorkpaperPDF WIN32 src/main.cpp src/pdf.cpp src/pdfops.cpp src/convert.cpp src/marks.cpp src/annots.cpp src/textedit.cpp res/app.rc)
 target_compile_definitions(WorkpaperPDF PRIVATE UNICODE _UNICODE NOMINMAX _CRT_SECURE_NO_WARNINGS)
 target_include_directories(WorkpaperPDF PRIVATE src "${PDFIUM_DIR}/include")
 target_link_libraries(WorkpaperPDF PRIVATE "${PDFIUM_DIR}/lib/pdfium.dll.lib" comctl32 comdlg32 shell32 gdi32 user32 advapi32 ole32 oleaut32 windowscodecs uuid)
@@ -27,3 +27,9 @@ add_executable(annots_test tests/annots_test.cpp src/annots.cpp src/marks.cpp sr
 target_include_directories(annots_test PRIVATE src "${PDFIUM_DIR}/include")
 target_link_libraries(annots_test PRIVATE "${PDFIUM_DIR}/lib/pdfium.dll.lib")
 target_compile_options(annots_test PRIVATE /utf-8 /D_CRT_SECURE_NO_WARNINGS)
+
+# Unit tests for text editing.
+add_executable(textedit_test tests/textedit_test.cpp src/textedit.cpp src/pdfops.cpp)
+target_include_directories(textedit_test PRIVATE src "${PDFIUM_DIR}/include")
+target_link_libraries(textedit_test PRIVATE "${PDFIUM_DIR}/lib/pdfium.dll.lib")
+target_compile_options(textedit_test PRIVATE /utf-8 /D_CRT_SECURE_NO_WARNINGS)

@@ -40,6 +40,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
           build\Release\annots_test.exe tests\sample-60-pages.pdf
           if ($LASTEXITCODE -ne 0) { throw "tickmark tests failed" }
+          build\Release\textedit_test.exe tests\sample-60-pages.pdf C:\Windows\Fonts\calibri.ttf
+          if ($LASTEXITCODE -ne 0) { throw "text editing tests failed" }
 
       - name: Conversion check
         shell: pwsh
