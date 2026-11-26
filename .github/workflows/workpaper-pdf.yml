@@ -40,6 +40,27 @@ jobs:
           build\Release\ops_test.exe tests\sample-60-pages.pdf
           if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
 
+      - name: Conversion check
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          New-Item -ItemType Directory -Force convtest | Out-Null
+          $bmp = New-Object System.Drawing.Bitmap 800, 500
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.Clear([System.Drawing.Color]::White)
+          $g.DrawString("Bank confirmation screenshot", (New-Object System.Drawing.Font "Arial", 28), [System.Drawing.Brushes]::DarkBlue, 20, 40)
+          $bmp.Save("$PWD\convtest\shot.png", [System.Drawing.Imaging.ImageFormat]::Png)
+          $bmp.Save("$PWD\convtest\photo.jpg", [System.Drawing.Imaging.ImageFormat]::Jpeg)
+          $bmp.Save("$PWD\convtest\anim.gif", [System.Drawing.Imaging.ImageFormat]::Gif)
+          Set-Content convtest\notes.txt ("Workpaper notes`r`n" + (1..120 | ForEach-Object { "Line $_ of the notes file" }) -join "`r`n")
+          Start-Process build\Release\WorkpaperPDF.exe -ArgumentList '--combine', "$PWD\convtest\out.pdf", "$PWD\convtest\shot.png", "$PWD\convtest\photo.jpg", "$PWD\convtest\anim.gif", "$PWD\convtest\notes.txt", "$PWD\tests\sample-60-pages.pdf" -Wait
+          Get-Content convtest\out.pdf.log
+          if (-not (Select-String -Path convtest\out.pdf.log -Pattern '^saved=1$' -Quiet)) { throw "conversion failed" }
+          Start-Process build\Release\WorkpaperPDF.exe -ArgumentList '--benchmark', "$PWD\convtest\out.pdf", "$PWD\convtest\check.txt" -Wait
+          Get-Content convtest\check.txt
+          # 3 images + 3 text pages + 60 PDF pages
+          if (-not (Select-String -Path convtest\check.txt -Pattern '^pages=66$' -Quiet)) { throw "wrong page count after conversion" }
+
       - name: Speed check
         shell: pwsh
         run: |
@@ -85,6 +106,7 @@ jobs:
             workpaper-pdf/dist/WorkpaperPDF-portable.zip
             workpaper-pdf/dist/screenshot.png
             workpaper-pdf/speed.txt
+            workpaper-pdf/convtest/out.pdf
 
       - name: Publish download
         shell: pwsh

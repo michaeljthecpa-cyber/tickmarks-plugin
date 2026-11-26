@@ -1,3 +1,6 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include "pdfops.h"
 #include <algorithm>
 #include <cmath>

@@ -1,4 +1,9 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include "pdf.h"
+#include "pdfops.h"
+#include "fpdf_edit.h"
 
 void PdfInit() {
     FPDF_LIBRARY_CONFIG cfg = {};
@@ -15,7 +20,73 @@ void PdfDoc::Close() {
     doc = nullptr;
     if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
     file = INVALID_HANDLE_VALUE;
+    memory.reset();
     sizes.clear();
+}
+
+void PdfDoc::RefreshSizes() {
+    int n = doc ? FPDF_GetPageCount(doc) : 0;
+    sizes.assign(n > 0 ? n : 0, PageSize());
+    for (int i = 0; i < n; i++) {
+        FS_SIZEF s;
+        if (FPDF_GetPageSizeByIndexF(doc, i, &s) && s.width > 1 && s.height > 1) {
+            sizes[i].w = s.width;
+            sizes[i].h = s.height;
+        }
+    }
+}
+
+bool PdfDoc::OpenMemory(std::shared_ptr<std::vector<uint8_t>> bytes, const std::wstring& p, const std::wstring& t) {
+    Close();
+    doc = FPDF_LoadMemDocument64(bytes->data(), bytes->size(), nullptr);
+    if (!doc) return false;
+    memory = bytes;
+    path = p;
+    title = t;
+    RefreshSizes();
+    return true;
+}
+
+bool PdfDoc::NewEmpty(const std::wstring& t) {
+    Close();
+    doc = FPDF_CreateNewDocument();
+    path.clear();
+    title = t;
+    return doc != nullptr;
+}
+
+bool PdfDoc::SaveTo(const std::wstring& target, std::wstring& err) {
+    auto bytes = std::make_shared<std::vector<uint8_t>>();
+    if (!ops::SaveToBuffer(doc, *bytes)) {
+        err = L"The document could not be prepared for saving.";
+        return false;
+    }
+    std::wstring tmp = target + L".saving";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        err = L"Could not write to that folder. Check that you have permission, or choose Save As.";
+        return false;
+    }
+    DWORD wrote = 0;
+    BOOL ok = WriteFile(h, bytes->data(), (DWORD)bytes->size(), &wrote, nullptr) && wrote == bytes->size();
+    ok = ok && FlushFileBuffers(h);
+    CloseHandle(h);
+    if (!ok) {
+        DeleteFileW(tmp.c_str());
+        err = L"Saving failed part way (is the disk full?). The original file was not changed.";
+        return false;
+    }
+    // Let go of the original file before replacing it, then keep editing the saved copy.
+    std::wstring keepTitle;
+    size_t slash = target.find_last_of(L"\\/");
+    keepTitle = slash == std::wstring::npos ? target : target.substr(slash + 1);
+    OpenMemory(bytes, target, keepTitle);
+    if (!MoveFileExW(tmp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmp.c_str());
+        err = L"The file is open in another program, so it could not be replaced. Close it there, or choose Save As.";
+        return false;
+    }
+    return true;
 }
 
 int PdfDoc::GetBlock(void* param, unsigned long pos, unsigned char* buf, unsigned long size) {
@@ -65,16 +136,8 @@ bool PdfDoc::Open(const std::wstring& p, std::wstring& err) {
         Close();
         return false;
     }
-    int n = FPDF_GetPageCount(doc);
-    sizes.resize(n > 0 ? n : 0);
-    for (int i = 0; i < n; i++) {
-        FS_SIZEF s;
-        if (FPDF_GetPageSizeByIndexF(doc, i, &s) && s.width > 1 && s.height > 1) {
-            sizes[i].w = s.width;
-            sizes[i].h = s.height;
-        }
-    }
-    if (n <= 0) {
+    RefreshSizes();
+    if (sizes.empty()) {
         err = L"This PDF has no pages.";
         Close();
         return false;

@@ -1,3 +1,6 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 // Unit tests for pdfops. Build with any C++17 compiler against PDFium, run with the sample PDF path.
 #include <cstdio>
 #include <cstring>

@@ -1,5 +1,8 @@
 // Workpaper PDF: a fast PDF app for audit workpapers.
 // Build 1: viewer (tabs, continuous scroll, zoom, thumbnails, go to page).
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -17,11 +20,15 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <ole2.h>
+#include <set>
+#include "convert.h"
 #include "pdf.h"
+#include "pdfops.h"
 #include "resource.h"
 
 #define APP_NAME L"Workpaper PDF"
-#define APP_VERSION L"0.1.0 (build 1)"
+#define APP_VERSION L"0.2.0 (build 2)"
 static const wchar_t* kMainClass = L"WorkpaperPDFMain";
 static const wchar_t* kViewClass = L"WorkpaperPDFView";
 static const wchar_t* kThumbClass = L"WorkpaperPDFThumbs";
@@ -31,7 +38,8 @@ static const wchar_t* kRegKey = L"Software\\WorkpaperPDF";
 enum {
     ID_OPEN = 100, ID_CLOSETAB, ID_EXIT, ID_ZOOMIN, ID_ZOOMOUT, ID_ZOOM100, ID_FITWIDTH, ID_FITPAGE,
     ID_THUMBS, ID_GOTO, ID_NEXTTAB, ID_PREVTAB, ID_PREVPAGE, ID_NEXTPAGE, ID_FIRSTPAGE, ID_LASTPAGE,
-    ID_ABOUT, ID_SHORTCUTS, ID_PAGEEDIT = 300, ID_TABS = 301, ID_STATUS = 302,
+    ID_ABOUT, ID_SHORTCUTS, ID_SAVE, ID_SAVEAS, ID_UNDO, ID_REDO, ID_ROTR, ID_ROTL, ID_DUP, ID_DEL,
+    ID_INSERTFILE, ID_INSERTBLANK, ID_EXTRACT, ID_SELECTALL, ID_PAGEEDIT = 300, ID_TABS = 301, ID_STATUS = 302,
 };
 #define WM_APP_RENDER (WM_APP + 1)
 
@@ -56,6 +64,10 @@ struct Tab {
     std::vector<int> thumbTop, thumbH;
     int thumbW = 0, thumbTotal = 0, thumbScroll = 0;
     double openMs = 0;
+    bool dirty = false;
+    std::vector<std::shared_ptr<std::vector<uint8_t>>> undo, redo;
+    std::set<int> sel;  // selected page thumbnails
+    int anchor = -1;    // for shift-click ranges
 
     ~Tab() {
         for (auto& c : cache) if (c.bmp) DeleteObject(c.bmp);
@@ -236,7 +248,7 @@ static void UpdateStatus() {
         swprintf(buf, 512, L"%d", page + 1);
         SetWindowTextW(g_pageEdit, buf);
     }
-    SetWindowTextW(g_main, (t->pdf.Title() + L" - " APP_NAME).c_str());
+    SetWindowTextW(g_main, (t->pdf.Title() + (t->dirty ? L" *" : L"") + L" - " APP_NAME).c_str());
     if (page != g_lastShownPage) {
         g_lastShownPage = page;
         EnsureThumbVisible(t, page);
@@ -349,7 +361,7 @@ static bool RenderOneThumb(Tab* t) {
 // ---------------------------------------------------------------- tabs
 
 static void SaveLastPage(Tab* t) {
-    if (t && t->pdf.PageCount() > 0) RegSetDword(L"LastPage", t->pdf.Path(), (DWORD)CurrentPage(t));
+    if (t && t->pdf.PageCount() > 0 && !t->pdf.Untitled()) RegSetDword(L"LastPage", t->pdf.Path(), (DWORD)CurrentPage(t));
 }
 
 static void GoToPage(Tab* t, int page) {
@@ -362,7 +374,7 @@ static void GoToPage(Tab* t, int page) {
 static void RebuildTabStrip() {
     TabCtrl_DeleteAllItems(g_tabs);
     for (size_t i = 0; i < g_docs.size(); i++) {
-        std::wstring title = g_docs[i]->pdf.Title();
+        std::wstring title = g_docs[i]->pdf.Title() + (g_docs[i]->dirty ? L" *" : L"");
         TCITEMW it = {};
         it.mask = TCIF_TEXT;
         it.pszText = (LPWSTR)title.c_str();
@@ -413,8 +425,237 @@ static void OpenFile(const std::wstring& path) {
     if (RegGetDword(L"LastPage", path, last) && (int)last > 0 && (int)last < cur->pdf.PageCount()) GoToPage(cur, (int)last);
 }
 
+// ---------------------------------------------------------------- editing pages
+
+static void SetStatusText(const wchar_t* msg) {
+    if (msg) {
+        SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)(std::wstring(L"  ") + msg).c_str());
+        UpdateWindow(g_status);
+        SetCursor(LoadCursor(nullptr, IDC_WAIT));
+    } else {
+        UpdateStatus();
+    }
+}
+
+// The pages a page command acts on: the selected thumbnails, or the current page.
+static std::vector<int> TargetPages(Tab* t) {
+    std::vector<int> v(t->sel.begin(), t->sel.end());
+    if (v.empty()) v.push_back(CurrentPage(t));
+    return v;
+}
+
+static void ClearRenders(Tab* t) {
+    for (auto& c : t->cache) { if (c.bmp) DeleteObject(c.bmp); c = Cached(); }
+    for (auto& b : t->thumb) { if (b) DeleteObject(b); b = nullptr; }
+    t->cache.clear();
+    t->thumb.clear();
+}
+
+// Saves an undo point. Call before changing the document.
+static bool Checkpoint(Tab* t) {
+    auto snap = std::make_shared<std::vector<uint8_t>>();
+    if (!ops::SaveToBuffer(t->pdf.Handle(), *snap)) return false;
+    t->undo.push_back(snap);
+    if (t->undo.size() > 40) t->undo.erase(t->undo.begin());
+    t->redo.clear();
+    return true;
+}
+
+// Call after the document changed: re-reads pages and redraws everything.
+static void AfterEdit(Tab* t, int showPage, bool markDirty = true) {
+    t->pdf.RefreshSizes();
+    ClearRenders(t);
+    if (markDirty) t->dirty = true;
+    for (auto it = t->sel.begin(); it != t->sel.end();) it = *it >= t->pdf.PageCount() ? t->sel.erase(it) : std::next(it);
+    Layout(t);
+    LayoutThumbs(t);
+    RebuildTabStrip();
+    g_lastShownPage = -1;
+    if (showPage >= 0) GoToPage(t, showPage);
+    else Refresh(false);
+    InvalidateRect(g_thumbs, nullptr, FALSE);
+    InvalidateRect(g_view, nullptr, FALSE);
+    RequestRender();
+}
+
+static void RestoreSnapshot(Tab* t, std::vector<std::shared_ptr<std::vector<uint8_t>>>& from,
+                            std::vector<std::shared_ptr<std::vector<uint8_t>>>& to) {
+    if (from.empty()) return;
+    auto now = std::make_shared<std::vector<uint8_t>>();
+    if (!ops::SaveToBuffer(t->pdf.Handle(), *now)) return;
+    int page = CurrentPage(t);
+    auto snap = from.back();
+    from.pop_back();
+    std::wstring path = t->pdf.Path(), title = t->pdf.Title();
+    if (!t->pdf.OpenMemory(snap, path, title)) return;
+    to.push_back(now);
+    t->sel.clear();
+    AfterEdit(t, std::min(page, t->pdf.PageCount() - 1));
+}
+
+static void RotateSel(Tab* t, int q) {
+    if (!t || !Checkpoint(t)) return;
+    auto pages = TargetPages(t);
+    ops::RotatePages(t->pdf.Handle(), pages, q);
+    AfterEdit(t, -1);
+}
+
+static void DeleteSel(Tab* t) {
+    if (!t) return;
+    auto pages = TargetPages(t);
+    if ((int)pages.size() >= t->pdf.PageCount()) {
+        MessageBoxW(g_main, L"A PDF needs at least one page, so every page can't be deleted.", APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
+    if (!Checkpoint(t)) return;
+    ops::DeletePages(t->pdf.Handle(), pages);
+    t->sel.clear();
+    AfterEdit(t, std::min(pages.front(), t->pdf.PageCount() - 1));
+}
+
+static void DuplicateSel(Tab* t) {
+    if (!t || !Checkpoint(t)) return;
+    auto pages = TargetPages(t);
+    int at = ops::DuplicatePages(t->pdf.Handle(), pages);
+    if (at < 0) { t->undo.pop_back(); return; }
+    t->sel.clear();
+    for (size_t k = 0; k < pages.size(); k++) t->sel.insert(at + (int)k);
+    AfterEdit(t, at);
+}
+
+// Moves the selection so it starts before the page now at `gap` (0..count).
+static void MoveSelTo(Tab* t, int gap) {
+    auto pages = TargetPages(t);
+    int before = 0;
+    for (int p : pages) if (p < gap) before++;
+    int dest = gap - before;
+    bool noop = true;
+    for (size_t k = 0; k < pages.size(); k++) if (pages[k] != dest + (int)k) noop = false;
+    if (noop || !Checkpoint(t)) return;
+    ops::MovePages(t->pdf.Handle(), pages, dest);
+    t->sel.clear();
+    for (size_t k = 0; k < pages.size(); k++) t->sel.insert(dest + (int)k);
+    AfterEdit(t, dest);
+}
+
+static void ProgressCb(const wchar_t* msg) { SetStatusText(msg); }
+
+static void InsertFilesAt(Tab* t, int at, const std::vector<std::wstring>& files) {
+    if (!t || files.empty() || !Checkpoint(t)) return;
+    std::wstring errors;
+    SetStatusText(L"Adding pages...");
+    int added = InsertFiles(t->pdf.Handle(), at, files, errors, ProgressCb);
+    SetStatusText(nullptr);
+    if (added == 0) t->undo.pop_back();
+    else {
+        t->sel.clear();
+        for (int k = 0; k < added; k++) t->sel.insert(at + k);
+        AfterEdit(t, at);
+    }
+    if (!errors.empty()) MessageBoxW(g_main, (L"Some files could not be added:\n\n" + errors).c_str(), APP_NAME, MB_ICONWARNING);
+}
+
+static void RelayoutMain();
+static void SelectTab(int i);
+
+// Makes a new untitled document from non-PDF files dropped with nothing open.
+static void NewDocFromFiles(const std::vector<std::wstring>& files) {
+    static int counter = 1;
+    auto t = std::make_unique<Tab>();
+    t->pdf.NewEmpty(L"Untitled " + std::to_wstring(counter++));
+    std::wstring errors;
+    SetStatusText(L"Adding pages...");
+    int added = InsertFiles(t->pdf.Handle(), 0, files, errors, ProgressCb);
+    SetStatusText(nullptr);
+    if (!errors.empty()) MessageBoxW(g_main, (L"Some files could not be added:\n\n" + errors).c_str(), APP_NAME, MB_ICONWARNING);
+    if (added == 0) return;
+    t->pdf.RefreshSizes();
+    t->dirty = true;
+    g_docs.push_back(std::move(t));
+    RebuildTabStrip();
+    if (g_docs.size() == 1) RelayoutMain();
+    SelectTab((int)g_docs.size() - 1);
+}
+
+static bool PickSavePath(std::wstring& path, const std::wstring& suggest) {
+    wchar_t buf[MAX_PATH * 4] = {};
+    wcsncpy(buf, suggest.c_str(), MAX_PATH * 4 - 1);
+    OPENFILENAMEW ofn = {sizeof(ofn)};
+    ofn.hwndOwner = g_main;
+    ofn.lpstrFilter = L"PDF files (*.pdf)\0*.pdf\0";
+    ofn.lpstrDefExt = L"pdf";
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = MAX_PATH * 4;
+    ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!GetSaveFileNameW(&ofn)) return false;
+    path = buf;
+    return true;
+}
+
+static bool SaveTab(Tab* t, bool saveAs) {
+    if (!t) return false;
+    std::wstring target = t->pdf.Path();
+    if (saveAs || t->pdf.Untitled()) {
+        std::wstring suggest = t->pdf.Untitled() ? t->pdf.Title() + L".pdf" : t->pdf.Path();
+        if (!PickSavePath(target, suggest)) return false;
+    }
+    SetStatusText(L"Saving...");
+    std::wstring err;
+    bool ok = t->pdf.SaveTo(target, err);
+    SetStatusText(nullptr);
+    if (!ok) { MessageBoxW(g_main, (L"The file was not saved.\n\n" + err).c_str(), APP_NAME, MB_ICONWARNING); return false; }
+    t->dirty = false;
+    AfterEdit(t, -1, false);
+    return true;
+}
+
+static void ExtractSel(Tab* t) {
+    if (!t) return;
+    auto pages = TargetPages(t);
+    PdfDoc out;
+    out.NewEmpty(L"Extract");
+    if (ops::InsertFrom(out.Handle(), t->pdf.Handle(), pages, 0) <= 0) return;
+    std::wstring base = t->pdf.Title();
+    size_t dot = base.find_last_of(L'.');
+    if (dot != std::wstring::npos) base = base.substr(0, dot);
+    std::wstring path;
+    if (!PickSavePath(path, base + L" (pages).pdf")) return;
+    std::wstring err;
+    if (!out.SaveTo(path, err)) MessageBoxW(g_main, (L"The file was not saved.\n\n" + err).c_str(), APP_NAME, MB_ICONWARNING);
+}
+
+// Asks about unsaved changes. Returns false if the user cancelled.
+static bool ConfirmClose(Tab* t) {
+    if (!t->dirty) return true;
+    int r = MessageBoxW(g_main, (L"Save changes to " + t->pdf.Title() + L" before closing?").c_str(), APP_NAME,
+                        MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (r == IDCANCEL) return false;
+    if (r == IDYES) return SaveTab(t, false);
+    return true;
+}
+
+static void InsertFileDialog(Tab* t) {
+    if (!t) return;
+    std::vector<wchar_t> buf(65536, 0);
+    OPENFILENAMEW ofn = {sizeof(ofn)};
+    ofn.hwndOwner = g_main;
+    ofn.lpstrFilter = L"Files that can be added\0*.pdf;*.doc;*.docx;*.rtf;*.odt;*.txt;*.csv;*.png;*.gif;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = buf.data();
+    ofn.nMaxFile = (DWORD)buf.size();
+    ofn.lpstrTitle = L"Insert pages from files";
+    ofn.Flags = OFN_EXPLORER | OFN_ALLOWMULTISELECT | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn)) return;
+    std::vector<std::wstring> files;
+    std::wstring dir = buf.data();
+    const wchar_t* p = buf.data() + dir.size() + 1;
+    if (!*p) files.push_back(dir);
+    while (*p) { files.push_back(dir + L"\\" + p); p += wcslen(p) + 1; }
+    InsertFilesAt(t, CurrentPage(t) + 1, files);
+}
+
 static void CloseTab(int i) {
     if (i < 0 || i >= (int)g_docs.size()) return;
+    if (!ConfirmClose(g_docs[i].get())) return;
     SaveLastPage(g_docs[i].get());
     g_docs.erase(g_docs.begin() + i);
     RebuildTabStrip();
@@ -693,6 +934,54 @@ static LRESULT CALLBACK ViewProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 // ---------------------------------------------------------------- thumbnails pane
 
+// Drag state for reordering thumbnails, and the drop marker for files dragged in from Explorer.
+static int g_thumbPress = -1;     // thumbnail under the mouse when the button went down
+static bool g_thumbDragging = false;
+static POINT g_thumbPressPt;
+static int g_dropGap = -1;        // insertion point shown while dragging (0..count), -1 = none
+
+static int ThumbAt(Tab* t, int y) {
+    y += t->thumbScroll;
+    for (int i = 0; i < t->pdf.PageCount(); i++)
+        if (y >= t->thumbTop[i] - S(6) && y < t->thumbTop[i] + t->thumbH[i] + S(24)) return i;
+    return -1;
+}
+
+static int GapAt(Tab* t, int y) {
+    y += t->thumbScroll;
+    int n = t->pdf.PageCount();
+    for (int i = 0; i < n; i++)
+        if (y < t->thumbTop[i] + t->thumbH[i] / 2) return i;
+    return n;
+}
+
+static void ThumbAutoScroll(Tab* t, int y) {
+    RECT rc;
+    GetClientRect(g_thumbs, &rc);
+    int d = 0;
+    if (y < S(30)) d = -S(24);
+    else if (y > rc.bottom - S(30)) d = S(24);
+    if (!d) return;
+    t->thumbScroll = std::clamp(t->thumbScroll + d, 0, std::max(0, t->thumbTotal - (int)rc.bottom));
+    RequestRender();
+}
+
+static void ThumbMenu(Tab* t, POINT screen) {
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, ID_ROTR, L"Rotate right\tCtrl+R");
+    AppendMenuW(m, MF_STRING, ID_ROTL, L"Rotate left\tCtrl+Shift+R");
+    AppendMenuW(m, MF_STRING, ID_DUP, L"Duplicate\tCtrl+D");
+    AppendMenuW(m, MF_STRING, ID_DEL, L"Delete\tDel");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, ID_INSERTFILE, L"Insert pages from files...");
+    AppendMenuW(m, MF_STRING, ID_INSERTBLANK, L"Insert blank page");
+    AppendMenuW(m, MF_STRING, ID_EXTRACT, L"Save these pages as a new PDF...");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, ID_SELECTALL, L"Select all pages\tCtrl+A");
+    TrackPopupMenu(m, TPM_RIGHTBUTTON, screen.x, screen.y, 0, g_main, nullptr);
+    DestroyMenu(m);
+}
+
 static LRESULT CALLBACK ThumbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     Tab* t = Cur();
     switch (m) {
@@ -707,7 +996,6 @@ static LRESULT CALLBACK ThumbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         HBRUSH bg = CreateSolidBrush(RGB(0xF3, 0xF4, 0xF6));
         FillRect(buf, &rc, bg);
         DeleteObject(bg);
-        // Divider on the right edge.
         RECT div = {rc.right - 1, 0, rc.right, rc.bottom};
         HBRUSH dv = CreateSolidBrush(RGB(0xD0, 0xD4, 0xDA));
         FillRect(buf, &div, dv);
@@ -717,7 +1005,8 @@ static LRESULT CALLBACK ThumbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             HDC mem = CreateCompatibleDC(hdc);
             SelectObject(buf, g_font);
             SetBkMode(buf, TRANSPARENT);
-            HBRUSH sel = CreateSolidBrush(RGB(0x1F, 0x6F, 0xEB));
+            HBRUSH blue = CreateSolidBrush(RGB(0x1F, 0x6F, 0xEB));
+            HBRUSH selBg = CreateSolidBrush(RGB(0xD6, 0xE4, 0xFB));
             HBRUSH white = (HBRUSH)GetStockObject(WHITE_BRUSH);
             HBRUSH edge = CreateSolidBrush(RGB(0xC4, 0xC8, 0xCE));
             bool missing = false;
@@ -726,10 +1015,14 @@ static LRESULT CALLBACK ThumbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 if (y + t->thumbH[i] + S(30) < 0) continue;
                 if (y > rc.bottom) break;
                 int x = (rc.right - t->thumbW) / 2;
+                if (t->sel.count(i)) {
+                    RECT sb = {S(6), y - S(6), rc.right - S(7), y + t->thumbH[i] + S(24)};
+                    FillRect(buf, &sb, selBg);
+                }
                 RECT pr = {x, y, x + t->thumbW, y + t->thumbH[i]};
                 RECT fr = pr;
-                InflateRect(&fr, i == curPage ? S(3) : 1, i == curPage ? S(3) : 1);
-                FillRect(buf, &fr, i == curPage ? sel : edge);
+                InflateRect(&fr, i == curPage ? S(2) : 1, i == curPage ? S(2) : 1);
+                FillRect(buf, &fr, i == curPage ? blue : edge);
                 FillRect(buf, &pr, white);
                 if (t->thumb[i]) {
                     SelectObject(mem, t->thumb[i]);
@@ -737,11 +1030,20 @@ static LRESULT CALLBACK ThumbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 } else missing = true;
                 wchar_t num[16];
                 swprintf(num, 16, L"%d", i + 1);
-                RECT lr = {0, pr.bottom + S(4), rc.right, pr.bottom + S(24)};
+                RECT lr = {0, pr.bottom + S(4), rc.right, pr.bottom + S(22)};
                 SetTextColor(buf, i == curPage ? RGB(0x1F, 0x6F, 0xEB) : RGB(0x44, 0x48, 0x50));
                 DrawTextW(buf, num, -1, &lr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             }
-            DeleteObject(sel);
+            // Insertion marker while dragging pages or files.
+            if (g_dropGap >= 0) {
+                int n = t->pdf.PageCount();
+                int y = g_dropGap < n ? t->thumbTop[g_dropGap] - S(9) : t->thumbTop[n - 1] + t->thumbH[n - 1] + S(24);
+                y -= t->thumbScroll;
+                RECT bar = {S(10), y - S(2), rc.right - S(10), y + S(2)};
+                FillRect(buf, &bar, blue);
+            }
+            DeleteObject(blue);
+            DeleteObject(selBg);
             DeleteObject(edge);
             DeleteDC(mem);
             if (missing) RequestRender();
@@ -769,17 +1071,215 @@ static LRESULT CALLBACK ThumbProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+        SetFocus(h);
         if (t) {
-            int y = GET_Y_LPARAM(l) + t->thumbScroll;
-            for (int i = 0; i < t->pdf.PageCount(); i++) {
-                if (y >= t->thumbTop[i] - S(6) && y < t->thumbTop[i] + t->thumbH[i] + S(24)) { GoToPage(t, i); break; }
+            int i = ThumbAt(t, GET_Y_LPARAM(l));
+            bool ctrl = (w & MK_CONTROL) != 0, shift = (w & MK_SHIFT) != 0;
+            if (i < 0) {
+                if (m == WM_LBUTTONDOWN && !ctrl) t->sel.clear();
+            } else if (m == WM_RBUTTONDOWN) {
+                if (!t->sel.count(i)) { t->sel.clear(); t->sel.insert(i); t->anchor = i; }
+            } else if (shift && t->anchor >= 0) {
+                if (!ctrl) t->sel.clear();
+                for (int k = std::min(t->anchor, i); k <= std::max(t->anchor, i); k++) t->sel.insert(k);
+            } else if (ctrl) {
+                if (t->sel.count(i)) t->sel.erase(i); else t->sel.insert(i);
+                t->anchor = i;
+            } else {
+                // Keep a multi-selection if the press starts a drag on it.
+                if (!t->sel.count(i)) { t->sel.clear(); t->sel.insert(i); }
+                t->anchor = i;
+                g_thumbPress = i;
+                g_thumbPressPt = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                SetCapture(h);
             }
-            SetFocus(g_view);
+            if (i >= 0 && !ctrl && !shift && m == WM_LBUTTONDOWN) GoToPage(t, i);
+            InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
+    case WM_MOUSEMOVE:
+        if (t && g_thumbPress >= 0) {
+            POINT p = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            if (!g_thumbDragging && (abs(p.y - g_thumbPressPt.y) > S(6) || abs(p.x - g_thumbPressPt.x) > S(6))) g_thumbDragging = true;
+            if (g_thumbDragging) {
+                ThumbAutoScroll(t, p.y);
+                RECT rc;
+                GetClientRect(h, &rc);
+                g_dropGap = (p.x >= -S(40) && p.x <= rc.right + S(40)) ? GapAt(t, p.y) : -1;
+                SetCursor(LoadCursor(nullptr, g_dropGap >= 0 ? IDC_HAND : IDC_NO));
+                InvalidateRect(h, nullptr, FALSE);
+            }
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (t && g_thumbPress >= 0) {
+            bool dragged = g_thumbDragging;
+            int gap = g_dropGap;
+            g_thumbPress = -1;
+            g_thumbDragging = false;
+            g_dropGap = -1;
+            ReleaseCapture();
+            if (dragged) {
+                POINT sp = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                ClientToScreen(h, &sp);
+                // Dropped on another tab: copy the pages to the end of that document.
+                POINT tp = sp;
+                ScreenToClient(g_tabs, &tp);
+                TCHITTESTINFO hti = {tp, 0};
+                int tab = IsWindowVisible(g_tabs) ? TabCtrl_HitTest(g_tabs, &hti) : -1;
+                if (tab >= 0 && tab != g_cur) {
+                    Tab* dst = g_docs[tab].get();
+                    auto pages = TargetPages(t);
+                    if (Checkpoint(dst)) {
+                        int at = dst->pdf.PageCount();
+                        int n = ops::InsertFrom(dst->pdf.Handle(), t->pdf.Handle(), pages, at);
+                        if (n > 0) {
+                            dst->pdf.RefreshSizes();
+                            dst->dirty = true;
+                            ClearRenders(dst);
+                            RebuildTabStrip();
+                            wchar_t msg[200];
+                            swprintf(msg, 200, L"Copied %d page%s to %s.", n, n == 1 ? L"" : L"s", dst->pdf.Title().c_str());
+                            SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)(std::wstring(L"  ") + msg).c_str());
+                        } else dst->undo.pop_back();
+                    }
+                } else if (gap >= 0) {
+                    MoveSelTo(t, gap);
+                }
+            }
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    case WM_CAPTURECHANGED:
+        if (g_thumbPress >= 0) { g_thumbPress = -1; g_thumbDragging = false; g_dropGap = -1; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    case WM_CONTEXTMENU:
+        if (t) {
+            POINT p = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            if (p.x == -1) { p = {S(40), S(40)}; ClientToScreen(h, &p); }
+            ThumbMenu(t, p);
+        }
+        return 0;
+    case WM_KEYDOWN:
+        if (!t) break;
+        if (w == VK_DELETE) { DeleteSel(t); return 0; }
+        if (w == VK_UP || w == VK_DOWN || w == VK_PRIOR || w == VK_NEXT) {
+            int cur = t->sel.empty() ? CurrentPage(t) : (w == VK_UP || w == VK_PRIOR ? *t->sel.begin() : *t->sel.rbegin());
+            int step = (w == VK_PRIOR || w == VK_NEXT) ? 5 : 1;
+            int nx = std::clamp(cur + ((w == VK_UP || w == VK_PRIOR) ? -step : step), 0, t->pdf.PageCount() - 1);
+            if (GetKeyState(VK_SHIFT) >= 0 || t->anchor < 0) { t->sel.clear(); t->anchor = nx; t->sel.insert(nx); }
+            else { t->sel.clear(); for (int k = std::min(t->anchor, nx); k <= std::max(t->anchor, nx); k++) t->sel.insert(k); }
+            GoToPage(t, nx);
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        if (w == VK_ESCAPE) { t->sel.clear(); InvalidateRect(h, nullptr, FALSE); return 0; }
+        break;
+    case WM_GETDLGCODE:
+        return DLGC_WANTARROWS;
     }
     return DefWindowProcW(h, m, w, l);
 }
+
+// ---------------------------------------------------------------- dropping files from Explorer
+
+class DropTarget final : public IDropTarget {
+public:
+    virtual ~DropTarget() = default;
+private:
+    LONG refs = 1;
+    bool hasFiles = false;
+
+    static std::vector<std::wstring> Files(IDataObject* d) {
+        std::vector<std::wstring> out;
+        FORMATETC fe = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        STGMEDIUM sm;
+        if (FAILED(d->GetData(&fe, &sm))) return out;
+        HDROP drop = (HDROP)GlobalLock(sm.hGlobal);
+        if (drop) {
+            UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+            for (UINT i = 0; i < n; i++) {
+                UINT len = DragQueryFileW(drop, i, nullptr, 0);
+                std::wstring p(len, L'\0');
+                DragQueryFileW(drop, i, &p[0], len + 1);
+                out.push_back(p);
+            }
+            GlobalUnlock(sm.hGlobal);
+        }
+        ReleaseStgMedium(&sm);
+        return out;
+    }
+    // Where a drop at this screen point would go: a gap in the thumbnails, or -1 for the main view.
+    static int GapFor(POINTL pt) {
+        Tab* t = Cur();
+        if (!t || !g_showThumbs) return -1;
+        POINT p = {pt.x, pt.y};
+        ScreenToClient(g_thumbs, &p);
+        RECT rc;
+        GetClientRect(g_thumbs, &rc);
+        if (!PtInRect(&rc, p)) return -1;
+        ThumbAutoScroll(t, p.y);
+        return GapAt(t, p.y);
+    }
+
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == IID_IUnknown || riid == IID_IDropTarget) { *ppv = this; AddRef(); return S_OK; }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        LONG r = InterlockedDecrement(&refs);
+        if (!r) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* d, DWORD, POINTL pt, DWORD* effect) override {
+        FORMATETC fe = {CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        hasFiles = SUCCEEDED(d->QueryGetData(&fe));
+        return DragOver(0, pt, effect);
+    }
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL pt, DWORD* effect) override {
+        *effect = hasFiles ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        int gap = hasFiles ? GapFor(pt) : -1;
+        if (gap != g_dropGap) { g_dropGap = gap; InvalidateRect(g_thumbs, nullptr, FALSE); }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        g_dropGap = -1;
+        InvalidateRect(g_thumbs, nullptr, FALSE);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* d, DWORD, POINTL pt, DWORD* effect) override {
+        *effect = DROPEFFECT_COPY;
+        int gap = GapFor(pt);
+        g_dropGap = -1;
+        InvalidateRect(g_thumbs, nullptr, FALSE);
+        std::vector<std::wstring> files = Files(d), pdfs, others, unknown;
+        for (auto& f : files) {
+            if (!CanConvert(f)) unknown.push_back(f);
+            else if (IsPdfPath(f) && gap < 0) pdfs.push_back(f);
+            else others.push_back(f);
+        }
+        SetForegroundWindow(g_main);
+        // PDFs dropped on the page area open in their own tabs.
+        for (auto& f : pdfs) OpenFile(f);
+        // Everything else becomes pages: at the marker, after the current page, or in a new document.
+        Tab* t = Cur();
+        if (!others.empty()) {
+            if (!t) NewDocFromFiles(others);
+            else InsertFilesAt(t, gap >= 0 ? gap : CurrentPage(t) + 1, others);
+        }
+        if (!unknown.empty()) {
+            std::wstring names;
+            for (auto& f : unknown) names += f.substr(f.find_last_of(L"\\/") + 1) + L"\n";
+            MessageBoxW(g_main, (L"These files can't be added. Workpaper PDF takes PDF, Word, text and image files.\n\n" + names).c_str(),
+                        APP_NAME, MB_ICONINFORMATION);
+        }
+        return S_OK;
+    }
+};
 
 // ---------------------------------------------------------------- toolbar
 
@@ -792,6 +1292,8 @@ struct ToolButton {
 };
 static ToolButton g_buttons[] = {
     {ID_OPEN, L"\xE8E5", L"Open", L"Open (Ctrl+O)", {}},
+    {ID_SAVE, L"\xE74E", L"Save", L"Save (Ctrl+S)", {}},
+    {ID_UNDO, L"\xE7A7", nullptr, L"Undo (Ctrl+Z)", {}},
     {ID_THUMBS, L"\xE8A9", L"Pages", L"Show or hide page thumbnails (F4)", {}},
     {ID_PREVPAGE, L"\xE70E", nullptr, L"Previous page (Left arrow)", {}},
     {ID_NEXTPAGE, L"\xE70D", nullptr, L"Next page (Right arrow)", {}},
@@ -800,6 +1302,9 @@ static ToolButton g_buttons[] = {
     {ID_ZOOMIN, L"\xE8A3", nullptr, L"Zoom in (Ctrl+plus)", {}},
     {ID_FITWIDTH, L"\xE9A6", L"Fit width", L"Fit width (Ctrl+1)", {}},
     {ID_FITPAGE, L"\xE740", L"Fit page", L"Fit page (Ctrl+2)", {}},
+    {ID_ROTR, L"\xE7AD", L"Rotate", L"Rotate selected pages right (Ctrl+R)", {}},
+    {ID_INSERTFILE, L"\xE710", L"Insert", L"Insert pages from files", {}},
+    {ID_DEL, L"\xE74D", L"Delete", L"Delete selected pages (Del)", {}},
 };
 static int g_hot = -1;
 static RECT g_pageBoxRect;
@@ -1022,6 +1527,14 @@ static void ShowShortcuts() {
                 L"Actual size\tCtrl+0\n"
                 L"Fit width / fit page\tCtrl+1 / Ctrl+2\n"
                 L"Page thumbnails\tF4\n"
+                L"Save / Save as\tCtrl+S / Ctrl+Shift+S\n"
+                L"Undo / redo\tCtrl+Z / Ctrl+Y\n"
+                L"Rotate pages\tCtrl+R / Ctrl+Shift+R\n"
+                L"Duplicate pages\tCtrl+D\n"
+                L"Delete pages\tDel (in thumbnails)\n"
+                L"Select pages\tClick, Ctrl+click, Shift+click\n"
+                L"Move pages\tDrag thumbnails\n"
+                L"Add pages\tDrop files on the thumbnails\n"
                 L"Pan\tDrag with the mouse",
                 L"Keyboard shortcuts", MB_OK);
 }
@@ -1044,7 +1557,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_status = CreateWindowExW(0, STATUSCLASSNAMEW, nullptr, WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, h,
                                    (HMENU)(INT_PTR)ID_STATUS, g_inst, nullptr);
         CreateFonts();
-        DragAcceptFiles(h, TRUE);
+        RegisterDragDrop(h, new DropTarget());
         RelayoutMain();
         UpdateStatus();
         return 0;
@@ -1079,22 +1592,6 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (i >= 0) CloseTab(i);
         }
         return 0;
-    case WM_DROPFILES: {
-        HDROP d = (HDROP)w;
-        UINT n = DragQueryFileW(d, 0xFFFFFFFF, nullptr, 0);
-        int skipped = 0;
-        for (UINT i = 0; i < n; i++) {
-            wchar_t p[MAX_PATH * 4];
-            DragQueryFileW(d, i, p, MAX_PATH * 4);
-            if (IsPdf(p)) OpenFile(p);
-            else skipped++;
-        }
-        DragFinish(d);
-        if (skipped)
-            MessageBoxW(h, L"Only PDF files can be opened in this build. Dropping Word, text and image files in to add them as pages arrives in build 2.",
-                        APP_NAME, MB_ICONINFORMATION);
-        return 0;
-    }
     case WM_COPYDATA: {
         // A second copy of the app was started with a file: open it here.
         COPYDATASTRUCT* cd = (COPYDATASTRUCT*)l;
@@ -1135,6 +1632,31 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_FIRSTPAGE: if (t) GoToPage(t, 0); break;
         case ID_LASTPAGE: if (t) GoToPage(t, t->pdf.PageCount() - 1); break;
         case ID_SHORTCUTS: ShowShortcuts(); break;
+        case ID_SAVE: SaveTab(t, false); break;
+        case ID_SAVEAS: SaveTab(t, true); break;
+        case ID_UNDO: if (t) RestoreSnapshot(t, t->undo, t->redo); break;
+        case ID_REDO: if (t) RestoreSnapshot(t, t->redo, t->undo); break;
+        case ID_ROTR: RotateSel(t, 1); break;
+        case ID_ROTL: RotateSel(t, -1); break;
+        case ID_DUP: DuplicateSel(t); break;
+        case ID_DEL: DeleteSel(t); break;
+        case ID_INSERTFILE: InsertFileDialog(t); break;
+        case ID_INSERTBLANK:
+            if (t && Checkpoint(t)) {
+                int at = (t->sel.empty() ? CurrentPage(t) : *t->sel.rbegin()) + 1;
+                ops::InsertBlank(t->pdf.Handle(), at, at - 1);
+                t->sel.clear();
+                t->sel.insert(at);
+                AfterEdit(t, at);
+            }
+            break;
+        case ID_EXTRACT: ExtractSel(t); break;
+        case ID_SELECTALL:
+            if (t) {
+                for (int i = 0; i < t->pdf.PageCount(); i++) t->sel.insert(i);
+                InvalidateRect(g_thumbs, nullptr, FALSE);
+            }
+            break;
         case ID_ABOUT:
             MessageBoxW(h, APP_NAME L"\nVersion " APP_VERSION L"\n\nA fast PDF app for audit workpapers.\nPDF engine: PDFium (BSD licence).",
                         L"About " APP_NAME, MB_OK | MB_ICONINFORMATION);
@@ -1143,7 +1665,9 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CLOSE:
+        for (auto& d : g_docs) if (!ConfirmClose(d.get())) return 0;
         for (auto& d : g_docs) SaveLastPage(d.get());
+        RevokeDragDrop(h);
         SavePlacement();
         DestroyWindow(h);
         return 0;
@@ -1156,11 +1680,25 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static HMENU BuildMenu() {
-    HMENU bar = CreateMenu(), file = CreatePopupMenu(), view = CreatePopupMenu(), help = CreatePopupMenu();
+    HMENU bar = CreateMenu(), file = CreatePopupMenu(), edit = CreatePopupMenu(), pages = CreatePopupMenu(), view = CreatePopupMenu(),
+          help = CreatePopupMenu();
     AppendMenuW(file, MF_STRING, ID_OPEN, L"&Open...\tCtrl+O");
+    AppendMenuW(file, MF_STRING, ID_SAVE, L"&Save\tCtrl+S");
+    AppendMenuW(file, MF_STRING, ID_SAVEAS, L"Save &as...\tCtrl+Shift+S");
+    AppendMenuW(file, MF_STRING, ID_EXTRACT, L"Save selected pages as a new PDF...");
     AppendMenuW(file, MF_STRING, ID_CLOSETAB, L"&Close tab\tCtrl+W");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, ID_EXIT, L"E&xit");
+    AppendMenuW(edit, MF_STRING, ID_UNDO, L"&Undo\tCtrl+Z");
+    AppendMenuW(edit, MF_STRING, ID_REDO, L"&Redo\tCtrl+Y");
+    AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(edit, MF_STRING, ID_SELECTALL, L"Select all pages\tCtrl+A");
+    AppendMenuW(pages, MF_STRING, ID_INSERTFILE, L"&Insert pages from files...");
+    AppendMenuW(pages, MF_STRING, ID_INSERTBLANK, L"Insert &blank page");
+    AppendMenuW(pages, MF_STRING, ID_DUP, L"&Duplicate\tCtrl+D");
+    AppendMenuW(pages, MF_STRING, ID_ROTR, L"Rotate &right\tCtrl+R");
+    AppendMenuW(pages, MF_STRING, ID_ROTL, L"Rotate &left\tCtrl+Shift+R");
+    AppendMenuW(pages, MF_STRING, ID_DEL, L"De&lete\tDel (in thumbnails)");
     AppendMenuW(view, MF_STRING, ID_ZOOMIN, L"Zoom &in\tCtrl++");
     AppendMenuW(view, MF_STRING, ID_ZOOMOUT, L"Zoom &out\tCtrl+-");
     AppendMenuW(view, MF_STRING, ID_ZOOM100, L"&Actual size\tCtrl+0");
@@ -1177,6 +1715,8 @@ static HMENU BuildMenu() {
     AppendMenuW(help, MF_STRING, ID_SHORTCUTS, L"&Keyboard shortcuts");
     AppendMenuW(help, MF_STRING, ID_ABOUT, L"&About " APP_NAME);
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&File");
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)edit, L"&Edit");
+    AppendMenuW(bar, MF_POPUP, (UINT_PTR)pages, L"&Pages");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)view, L"&View");
     AppendMenuW(bar, MF_POPUP, (UINT_PTR)help, L"&Help");
     return bar;
@@ -1200,6 +1740,15 @@ static HACCEL BuildAccel() {
         {FCONTROL | FVIRTKEY, VK_HOME, ID_FIRSTPAGE},
         {FCONTROL | FVIRTKEY, VK_END, ID_LASTPAGE},
         {FVIRTKEY, VK_F4, ID_THUMBS},
+        {FCONTROL | FVIRTKEY, 'S', ID_SAVE},
+        {FCONTROL | FSHIFT | FVIRTKEY, 'S', ID_SAVEAS},
+        {FCONTROL | FVIRTKEY, 'Z', ID_UNDO},
+        {FCONTROL | FVIRTKEY, 'Y', ID_REDO},
+        {FCONTROL | FSHIFT | FVIRTKEY, 'Z', ID_REDO},
+        {FCONTROL | FVIRTKEY, 'R', ID_ROTR},
+        {FCONTROL | FSHIFT | FVIRTKEY, 'R', ID_ROTL},
+        {FCONTROL | FVIRTKEY, 'D', ID_DUP},
+        {FCONTROL | FVIRTKEY, 'A', ID_SELECTALL},
     };
     return CreateAcceleratorTableW(a, (int)(sizeof(a) / sizeof(a[0])));
 }
@@ -1256,6 +1805,29 @@ static int RunBenchmark(const wchar_t* pdfPath, const wchar_t* outPath) {
     return ok ? 0 : 1;
 }
 
+// Command line: WorkpaperPDF.exe --combine out.pdf file1 file2 ...  builds one PDF from the files
+// (used by the automated build to test conversion; handy for scripts too). Problems go to out.pdf.log.
+static int RunCombine(int argc, LPWSTR* argv) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    PdfInit();
+    PdfDoc doc;
+    doc.NewEmpty(L"Combined");
+    std::vector<std::wstring> files(argv + 3, argv + argc);
+    std::wstring errors, err;
+    int added = InsertFiles(doc.Handle(), 0, files, errors, nullptr);
+    doc.RefreshSizes();
+    bool ok = added > 0 && doc.SaveTo(argv[2], err);
+    FILE* fp = _wfopen((std::wstring(argv[2]) + L".log").c_str(), L"w");
+    if (fp) {
+        fprintf(fp, "pages_added=%d\nsaved=%d\n%ls%ls\n", added, ok ? 1 : 0, errors.c_str(), err.c_str());
+        fclose(fp);
+    }
+    doc.Close();
+    PdfShutdown();
+    CoUninitialize();
+    return ok ? 0 : 1;
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     g_inst = inst;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1263,6 +1835,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argc == 4 && wcscmp(argv[1], L"--benchmark") == 0) return RunBenchmark(argv[2], argv[3]);
+    if (argc >= 4 && wcscmp(argv[1], L"--combine") == 0) return RunCombine(argc, argv);
 
     // One window for the whole app: hand files to a copy that is already running.
     HWND existing = FindWindowW(kMainClass, nullptr);
@@ -1278,6 +1851,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
         return 0;
     }
 
+    OleInitialize(nullptr);
     INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_TAB_CLASSES | ICC_BAR_CLASSES};
     InitCommonControlsEx(&icc);
     PdfInit();
@@ -1321,5 +1895,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
         DispatchMessageW(&msg);
     }
     PdfShutdown();
+    OleUninitialize();
     return 0;
 }

@@ -1,6 +1,8 @@
 // Thin wrapper around a PDFium document.
 #pragma once
 #include <windows.h>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 #include "fpdfview.h"
@@ -18,7 +20,18 @@ public:
 
     // Opens the file. On failure returns false and sets err.
     bool Open(const std::wstring& path, std::wstring& err);
+    // Opens a document held in memory (an undo snapshot or a freshly saved copy).
+    bool OpenMemory(std::shared_ptr<std::vector<uint8_t>> bytes, const std::wstring& path, const std::wstring& title);
+    // Starts an empty document with no pages; the caller adds pages.
+    bool NewEmpty(const std::wstring& title);
     void Close();
+    // Re-reads page sizes after pages were added, removed, moved or rotated.
+    void RefreshSizes();
+    // Writes the document to `target` (safely, through a temporary file) and keeps working on it.
+    bool SaveTo(const std::wstring& target, std::wstring& err);
+
+    FPDF_DOCUMENT Handle() const { return doc; }
+    bool Untitled() const { return path.empty(); }
 
     int PageCount() const { return (int)sizes.size(); }
     const PageSize& Size(int i) const { return sizes[i]; }
@@ -38,6 +51,7 @@ private:
     FPDF_FILEACCESS access = {};
     std::vector<PageSize> sizes;
     std::wstring path, title;
+    std::shared_ptr<std::vector<uint8_t>> memory;
 };
 
 void PdfInit();
