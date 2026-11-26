@@ -36,7 +36,6 @@ jobs:
       - name: Unit tests
         shell: pwsh
         run: |
-          Copy-Item build\Release\pdfium.dll build\Release\tests\ -ErrorAction SilentlyContinue
           build\Release\ops_test.exe tests\sample-60-pages.pdf
           if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
 
@@ -52,7 +51,8 @@ jobs:
           $bmp.Save("$PWD\convtest\shot.png", [System.Drawing.Imaging.ImageFormat]::Png)
           $bmp.Save("$PWD\convtest\photo.jpg", [System.Drawing.Imaging.ImageFormat]::Jpeg)
           $bmp.Save("$PWD\convtest\anim.gif", [System.Drawing.Imaging.ImageFormat]::Gif)
-          Set-Content convtest\notes.txt ("Workpaper notes`r`n" + (1..120 | ForEach-Object { "Line $_ of the notes file" }) -join "`r`n")
+          $lines = @("Workpaper notes") + (1..120 | ForEach-Object { "Line $_ of the notes file" })
+          Set-Content convtest\notes.txt $lines
           Start-Process build\Release\WorkpaperPDF.exe -ArgumentList '--combine', "$PWD\convtest\out.pdf", "$PWD\convtest\shot.png", "$PWD\convtest\photo.jpg", "$PWD\convtest\anim.gif", "$PWD\convtest\notes.txt", "$PWD\tests\sample-60-pages.pdf" -Wait
           Get-Content convtest\out.pdf.log
           if (-not (Select-String -Path convtest\out.pdf.log -Pattern '^saved=1$' -Quiet)) { throw "conversion failed" }

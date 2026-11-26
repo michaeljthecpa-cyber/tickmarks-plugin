@@ -2,7 +2,7 @@
 
 A fast PDF app for audit workpapers. Opens in a blink, no account, no auto-updates, no background services.
 
-**This is build 1 (viewer).** Pages, tickmarks, annotations and text editing arrive in the next builds.
+**This is build 2.** It views PDFs and organizes pages. Tickmarks, annotations and text editing arrive in the next builds.
 
 ## Install
 
@@ -27,6 +27,23 @@ No installer? The zip version runs without installing: unzip it anywhere and run
 - **Zoom:** Ctrl + mouse wheel, Ctrl+plus / Ctrl+minus, Ctrl+0 actual size, Ctrl+1 fit width, Ctrl+2 fit page.
 - **Tabs:** Ctrl+Tab to switch, Ctrl+W or middle-click a tab to close.
 - The app remembers the last page you were on in each file, and its window size.
+
+## Organizing pages
+
+Work in the thumbnail strip on the left (F4 shows or hides it).
+
+- **Select pages:** click; Ctrl+click to add pages; Shift+click for a range; Ctrl+A for all.
+- **Reorder:** drag selected thumbnails up or down. A blue line shows where they'll land.
+- **Copy pages to another file:** drag thumbnails onto that file's tab.
+- **Add pages:** drag files from Explorer onto the thumbnails, at the spot you want. PDF, Word (.doc, .docx, .rtf),
+  text (.txt, .csv) and image files (.png, .gif, .jpg, .bmp, .tif) all become PDF pages.
+  Dropping them on the page area adds them after the current page. With nothing open, they start a new document.
+  Word files are converted by the copy of Microsoft Word on your computer, so they look exactly as in Word.
+- **Delete:** press Del (or the Delete button). **Duplicate:** Ctrl+D. **Rotate:** Ctrl+R right, Ctrl+Shift+R left.
+- **Right-click** a thumbnail for more: insert blank page, insert from files, save pages as a new PDF.
+- **Undo** anything with Ctrl+Z (redo with Ctrl+Y). Nothing changes on disk until you **Save** (Ctrl+S).
+  A `*` next to the file name means there are unsaved changes.
+- PDFs dropped on the page area open in their own tabs.
 - **Help > Keyboard shortcuts** lists every shortcut.
 
 ## Uninstall
