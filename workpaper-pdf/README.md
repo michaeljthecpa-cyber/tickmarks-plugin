@@ -2,7 +2,7 @@
 
 A fast PDF app for audit workpapers. Opens in a blink, no account, no auto-updates, no background services.
 
-**This is build 2.** It views PDFs and organizes pages. Tickmarks, annotations and text editing arrive in the next builds.
+**This is build 3.** It views PDFs, organizes pages, and adds tickmarks and comments. Text editing arrives in the next builds.
 
 ## Install
 
@@ -45,6 +45,22 @@ Work in the thumbnail strip on the left (F4 shows or hides it).
   A `*` next to the file name means there are unsaved changes.
 - PDFs dropped on the page area open in their own tabs.
 - **Help > Keyboard shortcuts** lists every shortcut.
+
+## Tickmarks and comments
+
+Open the **Marks** pane on the right with the **Marks** button or F6.
+
+- **Tickmarks:** pick a symbol (check, double check, F, CF, PY, TB, N/A and more), a circled number or a circled letter,
+  then click the page. Drag instead of clicking to make it any size. Shortcuts: K symbols, N numbers, L letters.
+- **Numbers and letters count up** by themselves (1, 2, 3 or A, B, C) when Auto-increment is ticked.
+  Use − and + to set the next one.
+- **Colour and size:** six colours and Small, Medium or Large. Your choices are remembered.
+- **Highlight (H):** drag across text. **Note:** click to drop a sticky note and type; Ctrl+Enter or click away to finish.
+- **Box, Oval and Pen:** drag to draw.
+- **Select (S):** click a mark or comment to move it, drag its corner to resize it, press Del to delete it.
+  Double-click a note to edit it. Esc goes back to the hand tool.
+- Marks are standard PDF annotations, so they show and print the same in Acrobat and any other PDF reader.
+- Ctrl+Z undoes marks too. Save (Ctrl+S) to keep them.
 
 ## Uninstall
 

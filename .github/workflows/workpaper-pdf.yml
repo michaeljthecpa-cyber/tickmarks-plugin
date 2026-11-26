@@ -38,6 +38,8 @@ jobs:
         run: |
           build\Release\ops_test.exe tests\sample-60-pages.pdf
           if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
+          build\Release\annots_test.exe tests\sample-60-pages.pdf
+          if ($LASTEXITCODE -ne 0) { throw "tickmark tests failed" }
 
       - name: Conversion check
         shell: pwsh
