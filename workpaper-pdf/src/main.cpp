@@ -326,7 +326,7 @@ static int CurrentPage(Tab* t) {
 static void UpdateScrollBars() {
     Tab* t = Cur();
     RECT rc = ViewClient();
-    SCROLLINFO si = {sizeof(si), SIF_ALL | SIF_DISABLENOSCROLL};
+    SCROLLINFO si = {sizeof(si), t ? (UINT)(SIF_ALL | SIF_DISABLENOSCROLL) : (UINT)SIF_ALL};
     si.nMin = 0;
     si.nMax = t ? t->docH - 1 : 0;
     si.nPage = rc.bottom;
@@ -3332,7 +3332,7 @@ static void NavPicked() {
     if (!g_navItems[i].nm.empty()) SelectAnnotByName(t, g_navItems[i].page, g_navItems[i].nm);
 }
 
-static const wchar_t* kSideNames[3] = {L"Pages", L"Bookmarks", L"Comments"};
+static const wchar_t* kSideNames[3] = {L"Pages", L"Outline", L"Notes"};
 
 static LRESULT CALLBACK SideProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
@@ -3871,17 +3871,20 @@ static void RelayoutMain() {
     MoveWindow(g_tabs, 0, toolH, rc.right, tabH, TRUE);
     int y = toolH + tabH;
     int h = std::max(0, (int)rc.bottom - statusH - y);
-    int thumbW = g_showThumbs ? (g_sideMode ? S(250) : S(212)) : 0;
+    // The start screen has the window to itself; the side panes come back with the first file.
+    bool hasDoc = !g_docs.empty();
+    bool showThumbs = g_showThumbs && hasDoc, showMarks = g_showMarks && hasDoc;
+    int thumbW = showThumbs ? (g_sideMode ? S(250) : S(212)) : 0;
     int sideH = S(46);
-    ShowWindow(g_side, g_showThumbs ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_side, showThumbs ? SW_SHOW : SW_HIDE);
     MoveWindow(g_side, 0, y, thumbW, sideH, TRUE);
-    ShowWindow(g_thumbs, g_showThumbs && g_sideMode == 0 ? SW_SHOW : SW_HIDE);
-    ShowWindow(g_navList, g_showThumbs && g_sideMode != 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_thumbs, showThumbs && g_sideMode == 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_navList, showThumbs && g_sideMode != 0 ? SW_SHOW : SW_HIDE);
     MoveWindow(g_thumbs, 0, y + sideH, thumbW, std::max(0, h - sideH), TRUE);
     MoveWindow(g_navList, 0, y + sideH, thumbW, std::max(0, h - sideH), TRUE);
-    if (g_showThumbs && g_sideMode && g_navDirty) FillNavList();
-    int marksW = g_showMarks ? S(232) : 0;
-    ShowWindow(g_marks, g_showMarks ? SW_SHOW : SW_HIDE);
+    if (showThumbs && g_sideMode && g_navDirty) FillNavList();
+    int marksW = showMarks ? S(232) : 0;
+    ShowWindow(g_marks, showMarks ? SW_SHOW : SW_HIDE);
     MoveWindow(g_marks, rc.right - marksW, y, marksW, h, TRUE);
     MoveWindow(g_view, thumbW, y, rc.right - thumbW - marksW, h, TRUE);
 }
@@ -3988,7 +3991,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_editProc = (WNDPROC)SetWindowLongPtrW(g_pageEdit, GWLP_WNDPROC, (LONG_PTR)PageEditProc);
         g_findEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, g_tool,
                                      (HMENU)(INT_PTR)ID_FINDEDIT, g_inst, nullptr);
-        SendMessageW(g_findEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search this file");
+        SendMessageW(g_findEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search");
         g_findProc = (WNDPROC)SetWindowLongPtrW(g_findEdit, GWLP_WNDPROC, (LONG_PTR)FindEditProc);
         g_side = CreateWindowExW(0, kSideClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, h, nullptr, g_inst, nullptr);
         g_navList = CreateWindowExW(0, L"LISTBOX", nullptr,

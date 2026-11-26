@@ -48,8 +48,8 @@ No installer? The zip version runs without installing: unzip it anywhere and run
   (but not `112,345.67`). Esc clears the search.
 - **Print:** Ctrl+P prints the file with its tickmarks and comments. File > **Print without marks and comments**
   prints the clean document. Landscape pages turn to fit the paper; oversized pages shrink to fit.
-- **Side pane (F4):** the tabs at its top switch between **Pages** (thumbnails), **Bookmarks** (the PDF's outline)
-  and **Comments** (every tickmark, note, highlight and shape, by page). Click an entry to jump to it.
+- **Side pane (F4):** the tabs at its top switch between **Pages** (thumbnails), **Outline** (the PDF's bookmarks)
+  and **Notes** (every tickmark, note, highlight and shape, by page). Click an entry to jump to it.
 - **Auto-recovery:** unsaved changes are copied aside every minute. If the app or the PC crashes, the next start
   offers to reopen them.
 
