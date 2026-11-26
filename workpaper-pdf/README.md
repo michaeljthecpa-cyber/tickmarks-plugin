@@ -2,7 +2,7 @@
 
 A fast PDF app for audit workpapers. Opens in a blink, no account, no auto-updates, no background services.
 
-**This is build 4.** It views PDFs, organizes pages, adds tickmarks and comments, and edits text.
+**This is build 5.** It views, searches and prints PDFs, organizes pages, adds tickmarks and comments, and edits text.
 
 ## Install
 
@@ -28,9 +28,22 @@ No installer? The zip version runs without installing: unzip it anywhere and run
 - **Tabs:** Ctrl+Tab to switch, Ctrl+W or middle-click a tab to close.
 - The app remembers the last page you were on in each file, and its window size.
 
+## Search, print and side pane
+
+- **Search:** press Ctrl+F (or click the search box at the top right), type, press Enter. Every match is
+  shaded yellow and the current one orange. Enter or F3 goes to the next, Shift+Enter or Shift+F3 to the previous.
+  Case doesn't matter, and amounts match with or without commas and $ signs: `12345.67` finds `$12,345.67`
+  (but not `112,345.67`). Esc clears the search.
+- **Print:** Ctrl+P prints the file with its tickmarks and comments. File > **Print without marks and comments**
+  prints the clean document. Landscape pages turn to fit the paper; oversized pages shrink to fit.
+- **Side pane (F4):** the tabs at its top switch between **Pages** (thumbnails), **Bookmarks** (the PDF's outline)
+  and **Comments** (every tickmark, note, highlight and shape, by page). Click an entry to jump to it.
+- **Auto-recovery:** unsaved changes are copied aside every minute. If the app or the PC crashes, the next start
+  offers to reopen them.
+
 ## Organizing pages
 
-Work in the thumbnail strip on the left (F4 shows or hides it).
+Work in the thumbnail strip on the left (F4 shows or hides it; pick **Pages** at its top).
 
 - **Select pages:** click; Ctrl+click to add pages; Shift+click for a range; Ctrl+A for all.
 - **Reorder:** drag selected thumbnails up or down. A blue line shows where they'll land.

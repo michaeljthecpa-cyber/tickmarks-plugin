@@ -31,14 +31,17 @@
 #include "fpdf_text.h"
 #include "fpdf_edit.h"
 #include "textedit.h"
+#include "find.h"
+#include <shlobj.h>
 #include <functional>
 #include "resource.h"
 
 #define APP_NAME L"Workpaper PDF"
-#define APP_VERSION L"0.4.0 (build 4)"
+#define APP_VERSION L"0.5.0 (build 5)"
 static const wchar_t* kMainClass = L"WorkpaperPDFMain";
 static const wchar_t* kViewClass = L"WorkpaperPDFView";
 static const wchar_t* kThumbClass = L"WorkpaperPDFThumbs";
+static const wchar_t* kSideClass = L"WorkpaperPDFSide";
 static const wchar_t* kToolClass = L"WorkpaperPDFToolbar";
 static const wchar_t* kRegKey = L"Software\\WorkpaperPDF";
 
@@ -48,7 +51,7 @@ enum {
     ID_ABOUT, ID_SHORTCUTS, ID_SAVE, ID_SAVEAS, ID_UNDO, ID_REDO, ID_ROTR, ID_ROTL, ID_DUP, ID_DEL,
     ID_INSERTFILE, ID_INSERTBLANK, ID_EXTRACT, ID_SELECTALL, ID_MARKSPANE, ID_TOOL_HAND, ID_TOOL_SELECT,
     ID_TOOL_TICK, ID_TOOL_NUMBER, ID_TOOL_LETTER, ID_TOOL_HIGHLIGHT, ID_TOOL_NOTE, ID_TOOL_BOX, ID_TOOL_OVAL, ID_TOOL_PEN, ID_TOOL_ADDTEXT, ID_TOOL_EDITTEXT,
-    ID_AUTOINC, ID_DELANNOT, ID_PAGEEDIT = 300, ID_TABS = 301, ID_STATUS = 302,
+    ID_AUTOINC, ID_DELANNOT, ID_FIND, ID_FINDNEXT, ID_FINDPREV, ID_PRINT, ID_PRINTCLEAN, ID_SIDE_PAGES, ID_SIDE_OUTLINE, ID_SIDE_COMMENTS, ID_PAGEEDIT = 300, ID_TABS = 301, ID_STATUS = 302, ID_FINDEDIT = 303, ID_NAVLIST = 304,
 };
 #define WM_APP_RENDER (WM_APP + 1)
 
@@ -87,6 +90,9 @@ struct Tab {
     std::vector<Step> undo, redo;
     std::set<int> sel;  // selected page thumbnails
     int anchor = -1;    // for shift-click ranges
+    int gen = 1;        // bumps on every change, for auto-recovery
+    int recGen = 0;     // generation last written to the recovery folder
+    std::wstring recId; // name of this tab's recovery copy
 
     ~Tab() {
         for (auto& c : cache) if (c.bmp) DeleteObject(c.bmp);
@@ -95,7 +101,7 @@ struct Tab {
 };
 
 static HINSTANCE g_inst;
-static HWND g_main, g_tool, g_tabs, g_thumbs, g_view, g_status, g_pageEdit;
+static HWND g_main, g_tool, g_tabs, g_thumbs, g_view, g_status, g_pageEdit, g_findEdit, g_side, g_navList;
 static std::vector<std::unique_ptr<Tab>> g_docs;
 static int g_cur = -1;
 static bool g_showThumbs = true;
@@ -403,6 +409,7 @@ static void RebuildTabStrip() {
 }
 
 static void RelayoutMain();
+static void NavChanged();
 
 static void SelectTab(int i) {
     if (g_docs.empty()) { g_cur = -1; Refresh(false); InvalidateRect(g_thumbs, nullptr, TRUE); return; }
@@ -410,6 +417,7 @@ static void SelectTab(int i) {
     TabCtrl_SetCurSel(g_tabs, g_cur);
     g_lastShownPage = -1;
     Tab* t = Cur();
+    NavChanged();
     Layout(t);
     LayoutThumbs(t);
     Refresh(false);
@@ -470,6 +478,9 @@ static void ClearRenders(Tab* t) {
     t->thumb.clear();
 }
 
+static void SearchChanged();
+static void NavChanged();
+
 // Saves an undo point. Call before changing the document.
 static bool Checkpoint(Tab* t) {
     auto snap = std::make_shared<std::vector<uint8_t>>();
@@ -486,7 +497,9 @@ static bool Checkpoint(Tab* t) {
 static void AfterEdit(Tab* t, int showPage, bool markDirty = true) {
     t->pdf.RefreshSizes();
     ClearRenders(t);
-    if (markDirty) t->dirty = true;
+    if (markDirty) { t->dirty = true; t->gen++; }
+    SearchChanged();
+    NavChanged();
     for (auto it = t->sel.begin(); it != t->sel.end();) it = *it >= t->pdf.PageCount() ? t->sel.erase(it) : std::next(it);
     Layout(t);
     LayoutThumbs(t);
@@ -505,6 +518,8 @@ static void RefreshPage(Tab* t, int page) {
     if (t->cache[page].bmp) { DeleteObject(t->cache[page].bmp); t->cache[page] = Cached(); }
     if (page < (int)t->thumb.size() && t->thumb[page]) { DeleteObject(t->thumb[page]); t->thumb[page] = nullptr; }
     if (!t->dirty) { t->dirty = true; RebuildTabStrip(); UpdateStatus(); }
+    t->gen++;
+    NavChanged();
     InvalidateRect(g_view, nullptr, FALSE);
     InvalidateRect(g_thumbs, nullptr, FALSE);
     RequestRender();
@@ -706,11 +721,15 @@ static void InsertFileDialog(Tab* t) {
 static void CommitNote();
 static void CommitText(bool cancel);
 static void ClearSelection();
+static void DropRecovery(Tab* t);
+static void ForgetSearch(Tab* t);
 static void CloseTab(int i) {
     if (i < 0 || i >= (int)g_docs.size()) return;
     CommitNote();
     ClearSelection();
     if (!ConfirmClose(g_docs[i].get())) return;
+    DropRecovery(g_docs[i].get());
+    ForgetSearch(g_docs[i].get());
     SaveLastPage(g_docs[i].get());
     g_docs.erase(g_docs.begin() + i);
     RebuildTabStrip();
@@ -914,6 +933,26 @@ static void SetTool(int tool) {
     };
     g_g.hoverOn = false;
     if (Cur()) SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)(std::wstring(L"  ") + hints[tool]).c_str());
+}
+
+static void ScrollTo(Tab* t, int x, int y);
+static void SelectAnnotByName(Tab* t, int page, const std::string& nm) {
+    FPDF_PAGE p = FPDF_LoadPage(t->pdf.Handle(), page);
+    if (!p) return;
+    for (auto& info : annots::List(p)) {
+        if (info.nm != nm) continue;
+        SetTool(kSelect);
+        g_g.selNm = nm;
+        g_g.selPage = page;
+        g_g.selSubtype = info.subtype;
+        g_g.selRect = info.rect;
+        RECT r = RectToView(t, p, page, info.rect);
+        RECT rc = ViewClient();
+        if (r.top < 0 || r.bottom > rc.bottom) ScrollTo(t, t->sx, t->sy + r.top - rc.bottom / 3);
+        break;
+    }
+    FPDF_ClosePage(p);
+    InvalidateRect(g_view, nullptr, FALSE);
 }
 
 static void PushAdd(Tab* t, int page, const std::string& nm, std::function<bool(Tab*)> make) {
@@ -1160,6 +1199,7 @@ static void CommitText(bool cancel) {
                         APP_NAME, MB_ICONINFORMATION);
             return;
         }
+        SearchChanged();
         SendMessageW(g_status, SB_SETTEXTW, 0,
                      (LPARAM)(r == textedit::kReplaced ? L"  Text changed."
                                                       : L"  Text changed. The old text is covered with white and retyped on top."));
@@ -1538,7 +1578,9 @@ static void ToolUp(Tab* t, POINT v) {
     InvalidateRect(g_view, nullptr, FALSE);
 }
 
+static void PaintMatches(HDC hdc, Tab* t);
 static void PaintOverlay(HDC hdc, Tab* t) {
+    PaintMatches(hdc, t);
     if (g_g.active && g_ms.tool == kHighlight && !g_g.textRects.empty()) {
         HBRUSH yb = CreateSolidBrush(RGB(0xFF, 0xE2, 0x00));
         for (auto r : g_g.textRects) {
@@ -1682,6 +1724,7 @@ static void PaneButton(HDC hdc, const RECT& r, bool on, bool hot) {
     DeleteObject(pen);
 }
 
+static int g_paneScroll = 0, g_paneContentH = 0;
 static void PaintMarksPane(HDC hdc, const RECT& rc) {
     HBRUSH bg = CreateSolidBrush(RGB(0xF3, 0xF4, 0xF6));
     FillRect(hdc, &rc, bg);
@@ -1692,7 +1735,7 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
     DeleteObject(dv);
     g_paneHits.clear();
     SetBkMode(hdc, TRANSPARENT);
-    int x0 = S(10), width = rc.right - S(20), y = S(8);
+    int x0 = S(10), width = rc.right - S(20), y = S(8) - g_paneScroll;
     auto heading = [&](const wchar_t* text) {
         SelectObject(hdc, g_font);
         SetTextColor(hdc, RGB(0x55, 0x5B, 0x66));
@@ -1855,7 +1898,8 @@ static void PaintMarksPane(HDC hdc, const RECT& rc) {
         y += bh + S(10);
     }
     // Shortcut reminder.
-    RECT hr = {x0, y, x0 + width, rc.bottom - S(6)};
+    RECT hr = {x0, y, x0 + width, y + S(110)};
+    g_paneContentH = y + S(116) + g_paneScroll;
     SelectObject(hdc, g_font);
     SetTextColor(hdc, RGB(0x6B, 0x72, 0x80));
     DrawTextW(hdc,
@@ -1890,6 +1934,22 @@ static void PaneAction(const PaneHit& h) {
 
 static LRESULT CALLBACK MarksProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
+    case WM_MOUSEWHEEL: {
+        // The pane scrolls when the window is too short to show all of it.
+        RECT rc;
+        GetClientRect(h, &rc);
+        int maxScroll = std::max(0, g_paneContentH - (int)rc.bottom);
+        g_paneScroll = std::clamp(g_paneScroll - GET_WHEEL_DELTA_WPARAM(w) * S(60) / WHEEL_DELTA, 0, maxScroll);
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_SIZE: {
+        RECT rc;
+        GetClientRect(h, &rc);
+        g_paneScroll = std::clamp(g_paneScroll, 0, std::max(0, g_paneContentH - (int)rc.bottom));
+        InvalidateRect(h, nullptr, FALSE);
+        break;
+    }
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(h, &ps);
@@ -2542,6 +2602,468 @@ public:
     }
 };
 
+// ---------------------------------------------------------------- search
+
+static struct {
+    Tab* tab = nullptr;
+    std::u16string query;
+    std::vector<find::Match> matches;
+    int cur = -1;
+    bool stale = true;
+} g_find;
+
+static void SearchChanged() {
+    g_find.stale = true;
+    g_find.matches.clear();
+    g_find.cur = -1;
+}
+
+static std::u16string FindQuery() {
+    int len = GetWindowTextLengthW(g_findEdit);
+    std::wstring q(len, L'\0');
+    GetWindowTextW(g_findEdit, &q[0], len + 1);
+    return ToU16(q);
+}
+
+// View rectangle of a search box (a fraction of the page) on page i.
+static RECT MatchRect(Tab* t, int i, const find::Box& b) {
+    RECT pr = PageRect(t, i);
+    double w = pr.right - pr.left, h = pr.bottom - pr.top;
+    return RECT{pr.left + (int)floor(b.left * w), pr.top + (int)floor(b.bottom * h), pr.left + (int)ceil(b.right * w),
+                pr.top + (int)ceil(b.top * h)};
+}
+
+static void ShowMatch(Tab* t) {
+    if (g_find.cur < 0 || g_find.cur >= (int)g_find.matches.size()) return;
+    auto& m = g_find.matches[g_find.cur];
+    if (m.page >= t->pdf.PageCount() || m.view.empty()) return;
+    RECT rc = ViewClient();
+    RECT r = MatchRect(t, m.page, m.view[0]);
+    int sx = t->sx, sy = t->sy;
+    if (r.top < S(40) || r.bottom > rc.bottom - S(40)) sy = t->sy + r.top - rc.bottom / 3;
+    if (r.left < 0 || r.right > rc.right) sx = t->sx + r.left - rc.right / 3;
+    ScrollTo(t, sx, sy);
+    wchar_t buf[128];
+    swprintf(buf, 128, L"  Match %d of %d (page %d). Enter or F3 for the next, Shift+Enter for the previous.", g_find.cur + 1,
+             (int)g_find.matches.size(), m.page + 1);
+    SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)buf);
+    InvalidateRect(g_view, nullptr, FALSE);
+}
+
+static void DoFind(bool back) {
+    Tab* t = Cur();
+    if (!t) return;
+    CommitNote();
+    std::u16string q = FindQuery();
+    if (q.find_first_not_of(u" ") == std::u16string::npos) {
+        SetFocus(g_findEdit);
+        return;
+    }
+    bool fresh = g_find.tab != t || q != g_find.query || g_find.stale;
+    if (fresh) {
+        SetStatusText(L"Searching...");
+        g_find.matches = find::FindAll(t->pdf.Handle(), q);
+        SetStatusText(nullptr);
+        g_find.tab = t;
+        g_find.query = q;
+        g_find.stale = false;
+        g_find.cur = -1;
+    }
+    int n = (int)g_find.matches.size();
+    if (!n) {
+        MessageBeep(MB_ICONINFORMATION);
+        SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)(L"  No matches for \u201C" + ToW(q) + L"\u201D.").c_str());
+        InvalidateRect(g_view, nullptr, FALSE);
+        return;
+    }
+    if (g_find.cur < 0) {
+        // Start from the page on screen.
+        int page = CurrentPage(t);
+        g_find.cur = back ? n - 1 : 0;
+        if (back) { for (int i = n - 1; i >= 0; i--) if (g_find.matches[i].page <= page) { g_find.cur = i; break; } }
+        else { for (int i = 0; i < n; i++) if (g_find.matches[i].page >= page) { g_find.cur = i; break; } }
+    } else {
+        g_find.cur = (g_find.cur + (back ? n - 1 : 1)) % n;
+    }
+    ShowMatch(t);
+}
+
+static void ForgetSearch(Tab* t) {
+    if (g_find.tab == t) { SearchChanged(); g_find.tab = nullptr; }
+}
+
+static void ClearFind() {
+    SearchChanged();
+    g_find.tab = nullptr;
+    InvalidateRect(g_view, nullptr, FALSE);
+    UpdateStatus();
+}
+
+// Draws the search matches on the visible pages: all in yellow, the current one in orange.
+static void PaintMatches(HDC hdc, Tab* t) {
+    if (g_find.tab != t || g_find.matches.empty()) return;
+    RECT rc = ViewClient();
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, 110, 0};
+    HDC mem = CreateCompatibleDC(hdc);
+    HBITMAP one = CreateCompatibleBitmap(hdc, 2, 1);
+    HGDIOBJ old = SelectObject(mem, one);
+    SetPixel(mem, 0, 0, RGB(0xFF, 0xD4, 0x00));
+    SetPixel(mem, 1, 0, RGB(0xFF, 0x7A, 0x00));
+    for (int k = 0; k < (int)g_find.matches.size(); k++) {
+        auto& m = g_find.matches[k];
+        if (m.page >= t->pdf.PageCount()) continue;
+        for (auto& b : m.view) {
+            RECT r = MatchRect(t, m.page, b);
+            if (r.bottom < 0 || r.top > rc.bottom || r.right < 0 || r.left > rc.right) continue;
+            InflateRect(&r, 1, 1);
+            AlphaBlend(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, mem, k == g_find.cur ? 1 : 0, 0, 1, 1, bf);
+        }
+    }
+    SelectObject(mem, old);
+    DeleteObject(one);
+    DeleteDC(mem);
+}
+
+static WNDPROC g_findProc;
+static LRESULT CALLBACK FindEditProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_KEYDOWN && w == VK_RETURN) { DoFind(GetKeyState(VK_SHIFT) < 0); return 0; }
+    if (m == WM_KEYDOWN && w == VK_ESCAPE) { ClearFind(); SetFocus(g_view); return 0; }
+    if (m == WM_CHAR && (w == VK_RETURN || w == VK_ESCAPE)) return 0;
+    return CallWindowProcW(g_findProc, h, m, w, l);
+}
+
+// ---------------------------------------------------------------- side pane: pages, outline, comments
+
+static int g_sideMode = 0;  // 0 thumbnails, 1 outline, 2 comments
+static bool g_navDirty = true;
+static const UINT_PTR kNavTimer = 7, kRecoveryTimer = 8;
+struct NavItem { int page; std::string nm; };
+static std::vector<NavItem> g_navItems;
+
+static void NavChanged() {
+    g_navDirty = true;
+    if (g_sideMode && g_main) SetTimer(g_main, kNavTimer, 400, nullptr);
+}
+
+static const wchar_t* CommentKind(FPDF_ANNOTATION a, int subtype, const std::string& nm) {
+    if (nm.rfind("wpp-tm", 0) == 0) return L"Tickmark";
+    switch (subtype) {
+    case FPDF_ANNOT_HIGHLIGHT: return L"Highlight";
+    case FPDF_ANNOT_TEXT: return L"Note";
+    case FPDF_ANNOT_FREETEXT: return L"Text box";
+    case FPDF_ANNOT_SQUARE: return L"Box";
+    case FPDF_ANNOT_CIRCLE: return L"Oval";
+    case FPDF_ANNOT_INK: return L"Pen";
+    case FPDF_ANNOT_STAMP: return L"Stamp";
+    case FPDF_ANNOT_UNDERLINE: return L"Underline";
+    case FPDF_ANNOT_STRIKEOUT: return L"Strikeout";
+    case FPDF_ANNOT_LINE: return L"Line";
+    case FPDF_ANNOT_POLYGON: case FPDF_ANNOT_POLYLINE: return L"Shape";
+    default: (void)a; return nullptr;  // links, form fields, popups: not comments
+    }
+}
+
+static void FillNavList() {
+    g_navDirty = false;
+    KillTimer(g_main, kNavTimer);
+    SendMessageW(g_navList, WM_SETREDRAW, FALSE, 0);
+    int top = (int)SendMessageW(g_navList, LB_GETTOPINDEX, 0, 0);
+    SendMessageW(g_navList, LB_RESETCONTENT, 0, 0);
+    g_navItems.clear();
+    Tab* t = Cur();
+    auto add = [](const std::wstring& s, int page, const std::string& nm) {
+        SendMessageW(g_navList, LB_ADDSTRING, 0, (LPARAM)s.c_str());
+        g_navItems.push_back({page, nm});
+    };
+    if (t && g_sideMode == 1) {
+        auto marks = find::Outline(t->pdf.Handle());
+        for (auto& b : marks) add(std::wstring(b.level * 3, L' ') + ToW(b.title), b.page, "");
+        if (marks.empty()) add(L"This PDF has no bookmarks.", -1, "");
+    } else if (t && g_sideMode == 2) {
+        int n = t->pdf.PageCount();
+        for (int i = 0; i < n; i++) {
+            FPDF_PAGE p = FPDF_LoadPage(t->pdf.Handle(), i);
+            if (!p) continue;
+            int count = FPDFPage_GetAnnotCount(p);
+            for (int k = 0; k < count; k++) {
+                FPDF_ANNOTATION a = FPDFPage_GetAnnot(p, k);
+                if (!a) continue;
+                int st = FPDFAnnot_GetSubtype(a);
+                char16_t buf[512] = {0};
+                std::string nm;
+                if (FPDFAnnot_GetStringValue(a, "NM", (FPDF_WCHAR*)buf, sizeof(buf)) > 2)
+                    for (int c = 0; buf[c]; c++) nm.push_back((char)buf[c]);
+                const wchar_t* kind = CommentKind(a, st, nm);
+                if (kind) {
+                    std::wstring line = L"p. " + std::to_wstring(i + 1) + L"   " + kind;
+                    char16_t txt[512] = {0};
+                    if (FPDFAnnot_GetStringValue(a, "Contents", (FPDF_WCHAR*)txt, sizeof(txt)) > 2) {
+                        std::wstring c;
+                        for (int j = 0; txt[j] && j < 80; j++) c.push_back(txt[j] == u'\r' || txt[j] == u'\n' ? L' ' : (wchar_t)txt[j]);
+                        if (!c.empty()) line += L": " + c;
+                    }
+                    add(line, i, nm);
+                }
+                FPDFPage_CloseAnnot(a);
+            }
+            FPDF_ClosePage(p);
+        }
+        if (g_navItems.empty()) add(L"No marks or comments yet.", -1, "");
+    }
+    SendMessageW(g_navList, LB_SETTOPINDEX, top, 0);
+    SendMessageW(g_navList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_navList, nullptr, TRUE);
+}
+
+static void SetSideMode(int mode) {
+    g_sideMode = mode;
+    if (!g_showThumbs) { g_showThumbs = true; RegSetDword(nullptr, L"Thumbnails", 1); }
+    RegSetDword(nullptr, L"SideMode", (DWORD)mode);
+    RelayoutMain();
+    if (mode) FillNavList();
+    InvalidateRect(g_side, nullptr, FALSE);
+}
+
+static void SelectAnnotByName(Tab* t, int page, const std::string& nm);
+
+static void NavPicked() {
+    int i = (int)SendMessageW(g_navList, LB_GETCURSEL, 0, 0);
+    Tab* t = Cur();
+    if (!t || i < 0 || i >= (int)g_navItems.size() || g_navItems[i].page < 0) return;
+    GoToPage(t, g_navItems[i].page);
+    if (!g_navItems[i].nm.empty()) SelectAnnotByName(t, g_navItems[i].page, g_navItems[i].nm);
+}
+
+static const wchar_t* kSideNames[3] = {L"Pages", L"Bookmarks", L"Comments"};
+
+static LRESULT CALLBACK SideProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        HBRUSH bg = CreateSolidBrush(RGB(0xF3, 0xF4, 0xF6));
+        FillRect(hdc, &rc, bg);
+        DeleteObject(bg);
+        SetBkMode(hdc, TRANSPARENT);
+        SelectObject(hdc, g_font);
+        int wEach = rc.right / 3;
+        for (int i = 0; i < 3; i++) {
+            RECT r = {i * wEach, 0, i == 2 ? rc.right : (i + 1) * wEach, rc.bottom};
+            SetTextColor(hdc, g_sideMode == i ? RGB(0x1F, 0x6F, 0xEB) : RGB(0x44, 0x48, 0x50));
+            DrawTextW(hdc, kSideNames[i], -1, &r, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            if (g_sideMode == i) {
+                RECT u = {r.left + S(6), rc.bottom - S(3), r.right - S(6), rc.bottom};
+                HBRUSH b = CreateSolidBrush(RGB(0x1F, 0x6F, 0xEB));
+                FillRect(hdc, &u, b);
+                DeleteObject(b);
+            }
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        RECT rc;
+        GetClientRect(h, &rc);
+        int i = std::clamp(GET_X_LPARAM(l) / std::max(1, (int)rc.right / 3), 0, 2);
+        SetSideMode(i);
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// ---------------------------------------------------------------- printing
+
+static void PrintDoc(Tab* t, bool withMarks) {
+    if (!t) return;
+    CommitNote();
+    PRINTDLGW pd = {sizeof(pd)};
+    pd.hwndOwner = g_main;
+    pd.Flags = PD_RETURNDC | PD_ALLPAGES | PD_NOSELECTION | PD_USEDEVMODECOPIESANDCOLLATE;
+    pd.nFromPage = 1;
+    pd.nToPage = (WORD)std::min(t->pdf.PageCount(), 65535);
+    pd.nMinPage = 1;
+    pd.nMaxPage = pd.nToPage;
+    pd.nCopies = 1;
+    if (!PrintDlgW(&pd)) return;
+    int from = 0, to = t->pdf.PageCount() - 1;
+    if (pd.Flags & PD_PAGENUMS) { from = std::max(0, pd.nFromPage - 1); to = std::min(to, pd.nToPage - 1); }
+    HDC dc = pd.hDC;
+    std::wstring name = t->pdf.Title();
+    DOCINFOW di = {sizeof(di)};
+    di.lpszDocName = name.c_str();
+    if (StartDocW(dc, &di) <= 0) {
+        DeleteDC(dc);
+        MessageBoxW(g_main, L"The printer could not start printing.", APP_NAME, MB_ICONWARNING);
+        return;
+    }
+    int dpiX = GetDeviceCaps(dc, LOGPIXELSX), dpiY = GetDeviceCaps(dc, LOGPIXELSY);
+    int paperW = GetDeviceCaps(dc, HORZRES), paperH = GetDeviceCaps(dc, VERTRES);
+    // Render at up to 300 dpi; the printer driver scales the picture up to its own resolution.
+    double renderDpi = std::min(300, std::min(dpiX, dpiY));
+    bool ok = true;
+    for (int i = from; i <= to && ok; i++) {
+        wchar_t msg[96];
+        swprintf(msg, 96, L"Printing page %d of %d...", i - from + 1, to - from + 1);
+        SetStatusText(msg);
+        FPDF_PAGE page = FPDF_LoadPage(t->pdf.Handle(), i);
+        if (!page) continue;
+        double pw = FPDF_GetPageWidthF(page), ph = FPDF_GetPageHeightF(page);
+        // Turn landscape pages to fit portrait paper (and the other way round).
+        bool turn = (pw > ph) != (paperW > paperH);
+        double w = turn ? ph : pw, hgt = turn ? pw : ph;
+        // Shrink oversized pages to fit; smaller pages print at actual size.
+        double fit = std::min(1.0, std::min(paperW / (w * dpiX / 72.0), paperH / (hgt * dpiY / 72.0)));
+        int outW = (int)(w * dpiX / 72.0 * fit), outH = (int)(hgt * dpiY / 72.0 * fit);
+        int bw = std::max(1, (int)(w * renderDpi / 72.0 * fit)), bh = std::max(1, (int)(hgt * renderDpi / 72.0 * fit));
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+        bi.bmiHeader.biWidth = bw;
+        bi.bmiHeader.biHeight = -bh;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        std::vector<uint8_t> bits;
+        try { bits.resize((size_t)bw * bh * 4); } catch (...) { FPDF_ClosePage(page); ok = false; break; }
+        FPDF_BITMAP fb = FPDFBitmap_CreateEx(bw, bh, FPDFBitmap_BGRx, bits.data(), bw * 4);
+        FPDFBitmap_FillRect(fb, 0, 0, bw, bh, 0xFFFFFFFF);
+        FPDF_RenderPageBitmap(fb, page, 0, 0, bw, bh, turn ? 1 : 0, FPDF_PRINTING | (withMarks ? FPDF_ANNOT : 0));
+        FPDFBitmap_Destroy(fb);
+        FPDF_ClosePage(page);
+        if (StartPage(dc) <= 0) { ok = false; break; }
+        int x = (paperW - outW) / 2, y = (paperH - outH) / 2;
+        SetStretchBltMode(dc, HALFTONE);
+        SetBrushOrgEx(dc, 0, 0, nullptr);
+        StretchDIBits(dc, x, y, outW, outH, 0, 0, bw, bh, bits.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+        if (EndPage(dc) <= 0) ok = false;
+    }
+    if (ok) EndDoc(dc);
+    else AbortDoc(dc);
+    DeleteDC(dc);
+    if (pd.hDevMode) GlobalFree(pd.hDevMode);
+    if (pd.hDevNames) GlobalFree(pd.hDevNames);
+    SetStatusText(nullptr);
+    if (!ok) MessageBoxW(g_main, L"Printing stopped part way. Check the printer and try again.", APP_NAME, MB_ICONWARNING);
+}
+
+// ---------------------------------------------------------------- auto-recovery
+
+// Unsaved changes are copied to %LOCALAPPDATA%\WorkpaperPDF\Recovery every minute, and offered back after a crash.
+static std::wstring RecoveryDir() {
+    PWSTR base = nullptr;
+    std::wstring dir;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base))) {
+        dir = std::wstring(base) + L"\\WorkpaperPDF";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        dir += L"\\Recovery";
+        CreateDirectoryW(dir.c_str(), nullptr);
+    }
+    if (base) CoTaskMemFree(base);
+    return dir;
+}
+
+static bool WriteWhole(const std::wstring& path, const void* data, size_t size) {
+    std::wstring tmp = path + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD wrote = 0;
+    BOOL ok = WriteFile(h, data, (DWORD)size, &wrote, nullptr) && wrote == size;
+    CloseHandle(h);
+    if (!ok) { DeleteFileW(tmp.c_str()); return false; }
+    return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+}
+
+static void DropRecovery(Tab* t) {
+    if (!t || t->recId.empty()) return;
+    std::wstring dir = RecoveryDir();
+    DeleteFileW((dir + L"\\" + t->recId + L".pdf").c_str());
+    DeleteFileW((dir + L"\\" + t->recId + L".txt").c_str());
+    t->recGen = 0;
+}
+
+static void SaveRecovery() {
+    std::wstring dir;
+    for (auto& d : g_docs) {
+        Tab* t = d.get();
+        if (!t->dirty) { if (t->recGen) DropRecovery(t); continue; }
+        if (t->gen == t->recGen) continue;
+        if (dir.empty()) dir = RecoveryDir();
+        if (dir.empty()) return;
+        if (t->recId.empty()) {
+            static int serial = 0;
+            wchar_t id[64];
+            swprintf(id, 64, L"%08lx-%lu-%d", (unsigned long)GetTickCount(), GetCurrentProcessId(), ++serial);
+            t->recId = id;
+        }
+        std::vector<uint8_t> bytes;
+        if (!ops::SaveToBuffer(t->pdf.Handle(), bytes)) continue;
+        std::wstring info = t->pdf.Path() + L"\n" + t->pdf.Title();
+        if (WriteWhole(dir + L"\\" + t->recId + L".pdf", bytes.data(), bytes.size()) &&
+            WriteWhole(dir + L"\\" + t->recId + L".txt", info.c_str(), info.size() * sizeof(wchar_t)))
+            t->recGen = t->gen;
+    }
+}
+
+static void OfferRecovery() {
+    std::wstring dir = RecoveryDir();
+    if (dir.empty()) return;
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW((dir + L"\\*.pdf").c_str(), &fd);
+    if (f == INVALID_HANDLE_VALUE) return;
+    std::vector<std::wstring> ids;
+    do {
+        std::wstring n = fd.cFileName;
+        ids.push_back(n.substr(0, n.size() - 4));
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    if (ids.empty()) return;
+    wchar_t q[256];
+    swprintf(q, 256, L"Workpaper PDF closed before %d file%s %s saved.\n\nOpen the recovered cop%s now? "
+                     L"(No discards them.)", (int)ids.size(), ids.size() == 1 ? L"" : L"s", ids.size() == 1 ? L"was" : L"were",
+             ids.size() == 1 ? L"y" : L"ies");
+    bool open = MessageBoxW(g_main, q, APP_NAME, MB_YESNO | MB_ICONQUESTION) == IDYES;
+    for (auto& id : ids) {
+        std::wstring pdf = dir + L"\\" + id + L".pdf", txt = dir + L"\\" + id + L".txt";
+        if (open) {
+            std::wstring path, title = L"Recovered";
+            HANDLE h = CreateFileW(txt.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                std::wstring info(4096, L'\0');
+                DWORD got = 0;
+                ReadFile(h, &info[0], (DWORD)(info.size() * sizeof(wchar_t)), &got, nullptr);
+                CloseHandle(h);
+                info.resize(got / sizeof(wchar_t));
+                size_t nl = info.find(L'\n');
+                path = info.substr(0, nl);
+                if (nl != std::wstring::npos) title = info.substr(nl + 1);
+            }
+            HANDLE h2 = CreateFileW(pdf.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (h2 != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER len = {};
+                GetFileSizeEx(h2, &len);
+                auto bytes = std::make_shared<std::vector<uint8_t>>((size_t)len.QuadPart);
+                DWORD got = 0;
+                ReadFile(h2, bytes->data(), (DWORD)bytes->size(), &got, nullptr);
+                CloseHandle(h2);
+                auto t = std::make_unique<Tab>();
+                if (got == bytes->size() && t->pdf.OpenMemory(bytes, path, title + L" (recovered)")) {
+                    t->dirty = true;
+                    t->gen = 1;
+                    g_docs.push_back(std::move(t));
+                    RebuildTabStrip();
+                    if (g_docs.size() == 1) RelayoutMain();
+                    SelectTab((int)g_docs.size() - 1);
+                }
+            }
+        }
+        DeleteFileW(pdf.c_str());
+        DeleteFileW(txt.c_str());
+    }
+    // The reopened copies are written back to the folder on the next timer tick.
+}
+
 // ---------------------------------------------------------------- toolbar
 
 struct ToolButton {
@@ -2550,6 +3072,7 @@ struct ToolButton {
     const wchar_t* label;
     const wchar_t* tip;
     RECT rc;
+    bool showLabel = true;
 };
 static ToolButton g_buttons[] = {
     {ID_OPEN, L"\xE8E5", L"Open", L"Open (Ctrl+O)", {}},
@@ -2569,31 +3092,42 @@ static ToolButton g_buttons[] = {
     {ID_DEL, L"\xE74D", L"Delete", L"Delete selected pages (Del)", {}},
 };
 static int g_hot = -1;
-static RECT g_pageBoxRect;
+static RECT g_pageBoxRect, g_findRect;
 
 static void LayoutToolbar() {
     HDC hdc = GetDC(g_tool);
     RECT rc;
     GetClientRect(g_tool, &rc);
-    int x = S(8), h = rc.bottom;
-    for (auto& b : g_buttons) {
-        if (b.id == 0) {
-            int w = S(110);
-            g_pageBoxRect = {x, 0, x + w, h};
-            MoveWindow(g_pageEdit, x + S(4), (h - S(22)) / 2, S(44), S(22), TRUE);
-            x += w;
-            continue;
+    int h = rc.bottom, x = 0;
+    // Drop the labels of the view and page buttons when the window is too narrow for them and the search box.
+    for (int pass = 0; pass < 2; pass++) {
+        x = S(8);
+        for (auto& b : g_buttons) {
+            if (b.id == 0) {
+                int w = S(110);
+                g_pageBoxRect = {x, 0, x + w, h};
+                MoveWindow(g_pageEdit, x + S(4), (h - S(22)) / 2, S(44), S(22), TRUE);
+                x += w;
+                continue;
+            }
+            bool core = b.id == ID_OPEN || b.id == ID_SAVE || b.id == ID_THUMBS || b.id == ID_MARKSPANE;
+            b.showLabel = b.label && (pass == 0 || core);
+            int w = S(32);
+            if (b.showLabel) {
+                SelectObject(hdc, g_font);
+                SIZE sz;
+                GetTextExtentPoint32W(hdc, b.label, (int)wcslen(b.label), &sz);
+                w = S(36) + sz.cx;
+            }
+            b.rc = {x, S(4), x + w, h - S(4)};
+            x += w + S(2);
         }
-        int w = S(32);
-        if (b.label) {
-            SelectObject(hdc, g_font);
-            SIZE sz;
-            GetTextExtentPoint32W(hdc, b.label, (int)wcslen(b.label), &sz);
-            w = S(36) + sz.cx;
-        }
-        b.rc = {x, S(4), x + w, h - S(4)};
-        x += w + S(2);
+        if (x + S(200) <= rc.right) break;
     }
+    int fw = std::clamp((int)rc.right - x - S(16), S(90), S(240));
+    int fx = std::max<int>(x + S(8), rc.right - fw - S(10));
+    g_findRect = {fx, 0, fx + fw, h};
+    if (g_findEdit) MoveWindow(g_findEdit, fx + S(26), (h - S(24)) / 2, fw - S(26), S(24), TRUE);
     ReleaseDC(g_tool, hdc);
 }
 
@@ -2634,15 +3168,22 @@ static LRESULT CALLBACK ToolProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             RECT g = b.rc;
             g.left += S(8);
             g.right = g.left + S(18);
-            if (!b.label) { g = b.rc; }
+            if (!b.showLabel) { g = b.rc; }
             SelectObject(buf, g_iconFont);
             DrawTextW(buf, b.glyph, -1, &g, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-            if (b.label) {
+            if (b.showLabel) {
                 RECT tr = b.rc;
                 tr.left += S(30);
                 SelectObject(buf, g_font);
                 DrawTextW(buf, b.label, -1, &tr, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
             }
+        }
+        // Magnifier in front of the search box.
+        {
+            RECT g = {g_findRect.left, 0, g_findRect.left + S(24), rc.bottom};
+            SelectObject(buf, g_iconFont);
+            SetTextColor(buf, RGB(0x55, 0x5B, 0x66));
+            DrawTextW(buf, L"\xE721", -1, &g, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         }
         // "of N" next to the page box.
         if (Cur()) {
@@ -2737,9 +3278,15 @@ static void RelayoutMain() {
     MoveWindow(g_tabs, 0, toolH, rc.right, tabH, TRUE);
     int y = toolH + tabH;
     int h = std::max(0, (int)rc.bottom - statusH - y);
-    int thumbW = g_showThumbs ? S(170) : 0;
-    ShowWindow(g_thumbs, g_showThumbs ? SW_SHOW : SW_HIDE);
-    MoveWindow(g_thumbs, 0, y, thumbW, h, TRUE);
+    int thumbW = g_showThumbs ? (g_sideMode ? S(250) : S(190)) : 0;
+    int sideH = S(30);
+    ShowWindow(g_side, g_showThumbs ? SW_SHOW : SW_HIDE);
+    MoveWindow(g_side, 0, y, thumbW, sideH, TRUE);
+    ShowWindow(g_thumbs, g_showThumbs && g_sideMode == 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_navList, g_showThumbs && g_sideMode != 0 ? SW_SHOW : SW_HIDE);
+    MoveWindow(g_thumbs, 0, y + sideH, thumbW, std::max(0, h - sideH), TRUE);
+    MoveWindow(g_navList, 0, y + sideH, thumbW, std::max(0, h - sideH), TRUE);
+    if (g_showThumbs && g_sideMode && g_navDirty) FillNavList();
     int marksW = g_showMarks ? S(232) : 0;
     ShowWindow(g_marks, g_showMarks ? SW_SHOW : SW_HIDE);
     MoveWindow(g_marks, rc.right - marksW, y, marksW, h, TRUE);
@@ -2764,6 +3311,8 @@ static void CreateFonts() {
     if (!found) face = L"Segoe MDL2 Assets";
     g_iconFont = CreateFontW(-S(15), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, face);
     if (g_pageEdit) SendMessageW(g_pageEdit, WM_SETFONT, (WPARAM)g_font, TRUE);
+    if (g_findEdit) SendMessageW(g_findEdit, WM_SETFONT, (WPARAM)g_font, TRUE);
+    if (g_navList) SendMessageW(g_navList, WM_SETFONT, (WPARAM)g_font, TRUE);
     if (g_tabs) SendMessageW(g_tabs, WM_SETFONT, (WPARAM)g_font, TRUE);
 }
 
@@ -2818,6 +3367,14 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_pageEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_CENTER | ES_NUMBER | ES_AUTOHSCROLL,
                                      0, 0, 0, 0, g_tool, (HMENU)(INT_PTR)ID_PAGEEDIT, g_inst, nullptr);
         g_editProc = (WNDPROC)SetWindowLongPtrW(g_pageEdit, GWLP_WNDPROC, (LONG_PTR)PageEditProc);
+        g_findEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 0, 0, g_tool,
+                                     (HMENU)(INT_PTR)ID_FINDEDIT, g_inst, nullptr);
+        SendMessageW(g_findEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search  (Ctrl+F)");
+        g_findProc = (WNDPROC)SetWindowLongPtrW(g_findEdit, GWLP_WNDPROC, (LONG_PTR)FindEditProc);
+        g_side = CreateWindowExW(0, kSideClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, h, nullptr, g_inst, nullptr);
+        g_navList = CreateWindowExW(0, L"LISTBOX", nullptr, WS_CHILD | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_HASSTRINGS,
+                                    0, 0, 0, 0, h, (HMENU)(INT_PTR)ID_NAVLIST, g_inst, nullptr);
+        SetTimer(h, kRecoveryTimer, 60 * 1000, nullptr);
         g_tabs = CreateWindowExW(0, WC_TABCONTROLW, nullptr, WS_CHILD | WS_CLIPSIBLINGS | TCS_FOCUSNEVER | TCS_TOOLTIPS, 0, 0, 0, 0, h,
                                  (HMENU)(INT_PTR)ID_TABS, g_inst, nullptr);
         g_thumbs = CreateWindowExW(0, kThumbClass, nullptr, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, h, nullptr, g_inst, nullptr);
@@ -2834,6 +3391,10 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_SIZE:
         RelayoutMain();
+        return 0;
+    case WM_TIMER:
+        if (w == kNavTimer) { KillTimer(h, kNavTimer); if (g_sideMode) FillNavList(); }
+        if (w == kRecoveryTimer) SaveRecovery();
         return 0;
     case WM_DPICHANGED: {
         g_dpi = HIWORD(w);
@@ -2919,6 +3480,15 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_TOOL_OVAL: SetTool(kOval); break;
         case ID_TOOL_PEN: SetTool(kPen); break;
         case ID_TOOL_ADDTEXT: SetTool(kAddText); break;
+        case ID_FIND: SetFocus(g_findEdit); SendMessageW(g_findEdit, EM_SETSEL, 0, -1); break;
+        case ID_FINDNEXT: DoFind(false); break;
+        case ID_FINDPREV: DoFind(true); break;
+        case ID_PRINT: PrintDoc(t, true); break;
+        case ID_PRINTCLEAN: PrintDoc(t, false); break;
+        case ID_SIDE_PAGES: SetSideMode(0); break;
+        case ID_SIDE_OUTLINE: SetSideMode(1); break;
+        case ID_SIDE_COMMENTS: SetSideMode(2); break;
+        case ID_NAVLIST: if (HIWORD(w) == LBN_SELCHANGE) NavPicked(); break;
         case ID_TOOL_EDITTEXT: SetTool(kEditText); break;
         case ID_AUTOINC: g_ms.autoInc = !g_ms.autoInc; SaveMarkSettings(); InvalidateRect(g_marks, nullptr, FALSE); break;
         case ID_DELANNOT: DeleteSelectedAnnot(t); break;
@@ -2957,6 +3527,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CLOSE:
         CommitNote();
         for (auto& d : g_docs) if (!ConfirmClose(d.get())) return 0;
+        for (auto& d : g_docs) DropRecovery(d.get());
+        KillTimer(h, kRecoveryTimer);
         for (auto& d : g_docs) SaveLastPage(d.get());
         RevokeDragDrop(h);
         SavePlacement();
@@ -2995,6 +3567,9 @@ static HMENU BuildMenu() {
     AppendMenuW(file, MF_STRING, ID_SAVE, L"&Save\tCtrl+S");
     AppendMenuW(file, MF_STRING, ID_SAVEAS, L"Save &as...\tCtrl+Shift+S");
     AppendMenuW(file, MF_STRING, ID_EXTRACT, L"Save selected pages as a new PDF...");
+    AppendMenuW(file, MF_STRING, ID_PRINT, L"&Print...\tCtrl+P");
+    AppendMenuW(file, MF_STRING, ID_PRINTCLEAN, L"Print &without marks and comments...");
+    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, ID_CLOSETAB, L"&Close tab\tCtrl+W");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, ID_EXIT, L"E&xit");
@@ -3002,6 +3577,10 @@ static HMENU BuildMenu() {
     AppendMenuW(edit, MF_STRING, ID_REDO, L"&Redo\tCtrl+Y");
     AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(edit, MF_STRING, ID_SELECTALL, L"Select all pages\tCtrl+A");
+    AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(edit, MF_STRING, ID_FIND, L"&Find...\tCtrl+F");
+    AppendMenuW(edit, MF_STRING, ID_FINDNEXT, L"Find &next\tF3");
+    AppendMenuW(edit, MF_STRING, ID_FINDPREV, L"Find pre&vious\tShift+F3");
     AppendMenuW(pages, MF_STRING, ID_INSERTFILE, L"&Insert pages from files...");
     AppendMenuW(pages, MF_STRING, ID_INSERTBLANK, L"Insert &blank page");
     AppendMenuW(pages, MF_STRING, ID_DUP, L"&Duplicate\tCtrl+D");
@@ -3018,7 +3597,10 @@ static HMENU BuildMenu() {
     AppendMenuW(view, MF_STRING, ID_FIRSTPAGE, L"First page\tCtrl+Home");
     AppendMenuW(view, MF_STRING, ID_LASTPAGE, L"Last page\tCtrl+End");
     AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(view, MF_STRING, ID_THUMBS, L"Page &thumbnails\tF4");
+    AppendMenuW(view, MF_STRING, ID_THUMBS, L"Show or hide the side &pane\tF4");
+    AppendMenuW(view, MF_STRING, ID_SIDE_PAGES, L"Side pane: pa&ges");
+    AppendMenuW(view, MF_STRING, ID_SIDE_OUTLINE, L"Side pane: &bookmarks");
+    AppendMenuW(view, MF_STRING, ID_SIDE_COMMENTS, L"Side pane: &comments list");
     AppendMenuW(view, MF_STRING, ID_NEXTTAB, L"Next tab\tCtrl+Tab");
     AppendMenuW(view, MF_STRING, ID_PREVTAB, L"Previous tab\tCtrl+Shift+Tab");
     AppendMenuW(help, MF_STRING, ID_SHORTCUTS, L"&Keyboard shortcuts");
@@ -3060,6 +3642,10 @@ static HACCEL BuildAccel() {
         {FCONTROL | FSHIFT | FVIRTKEY, 'R', ID_ROTL},
         {FCONTROL | FVIRTKEY, 'D', ID_DUP},
         {FCONTROL | FVIRTKEY, 'A', ID_SELECTALL},
+        {FCONTROL | FVIRTKEY, 'F', ID_FIND},
+        {FVIRTKEY, VK_F3, ID_FINDNEXT},
+        {FSHIFT | FVIRTKEY, VK_F3, ID_FINDPREV},
+        {FCONTROL | FVIRTKEY, 'P', ID_PRINT},
     };
     return CreateAcceleratorTableW(a, (int)(sizeof(a) / sizeof(a[0])));
 }
@@ -3174,9 +3760,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     Register(kMarksClass, MarksProc, LoadCursor(nullptr, IDC_ARROW), nullptr, nullptr);
     LoadMarkSettings();
     Register(kToolClass, ToolProc, LoadCursor(nullptr, IDC_ARROW), nullptr, nullptr);
+    Register(kSideClass, SideProc, LoadCursor(nullptr, IDC_HAND), nullptr, nullptr);
 
     DWORD th;
     if (RegGetDword(nullptr, L"Thumbnails", th)) g_showThumbs = th != 0;
+    if (RegGetDword(nullptr, L"SideMode", th)) g_sideMode = std::clamp((int)th, 0, 2);
 
     HWND h = CreateWindowExW(0, kMainClass, APP_NAME, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 1280, 860,
                              nullptr, BuildMenu(), inst, nullptr);
@@ -3198,6 +3786,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
         OpenFile(full);
     }
     LocalFree(argv);
+    OfferRecovery();
 
     g_accel = BuildAccel();
     MSG msg;

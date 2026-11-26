@@ -6,10 +6,10 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # PDFium prebuilt binaries (https://github.com/bblanchon/pdfium-binaries), unpacked by the build.
 set(PDFIUM_DIR "${CMAKE_SOURCE_DIR}/third_party/pdfium" CACHE PATH "PDFium binaries")
 
-add_executable(WorkpaperPDF WIN32 src/main.cpp src/pdf.cpp src/pdfops.cpp src/convert.cpp src/marks.cpp src/annots.cpp src/textedit.cpp res/app.rc)
+add_executable(WorkpaperPDF WIN32 src/main.cpp src/pdf.cpp src/pdfops.cpp src/convert.cpp src/marks.cpp src/annots.cpp src/textedit.cpp src/find.cpp res/app.rc)
 target_compile_definitions(WorkpaperPDF PRIVATE UNICODE _UNICODE NOMINMAX _CRT_SECURE_NO_WARNINGS)
 target_include_directories(WorkpaperPDF PRIVATE src "${PDFIUM_DIR}/include")
-target_link_libraries(WorkpaperPDF PRIVATE "${PDFIUM_DIR}/lib/pdfium.dll.lib" comctl32 comdlg32 shell32 gdi32 user32 advapi32 ole32 oleaut32 windowscodecs uuid)
+target_link_libraries(WorkpaperPDF PRIVATE "${PDFIUM_DIR}/lib/pdfium.dll.lib" comctl32 comdlg32 shell32 gdi32 user32 advapi32 ole32 oleaut32 windowscodecs uuid msimg32)
 target_compile_options(WorkpaperPDF PRIVATE /W3 /utf-8 /O2)
 # The manifest comes from app.rc.
 target_link_options(WorkpaperPDF PRIVATE /MANIFEST:NO)
@@ -33,3 +33,9 @@ add_executable(textedit_test tests/textedit_test.cpp src/textedit.cpp src/pdfops
 target_include_directories(textedit_test PRIVATE src "${PDFIUM_DIR}/include")
 target_link_libraries(textedit_test PRIVATE "${PDFIUM_DIR}/lib/pdfium.dll.lib")
 target_compile_options(textedit_test PRIVATE /utf-8 /D_CRT_SECURE_NO_WARNINGS)
+
+# Unit tests for search.
+add_executable(find_test tests/find_test.cpp src/find.cpp)
+target_include_directories(find_test PRIVATE src "${PDFIUM_DIR}/include")
+target_link_libraries(find_test PRIVATE "${PDFIUM_DIR}/lib/pdfium.dll.lib")
+target_compile_options(find_test PRIVATE /utf-8 /D_CRT_SECURE_NO_WARNINGS)
